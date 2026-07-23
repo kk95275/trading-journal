@@ -1,18 +1,50 @@
-# Trading Journal — XAUUSD backtester & journal
+# Trading Journal — bar-replay backtester
 
 A local-first trading journal + TradingView-style bar-replay backtester (TradeZella/Edgewonk-style),
 running entirely on this machine. No accounts, no cloud — all trade data lives in your browser's
-IndexedDB, chart data in `public/data/`.
+IndexedDB, chart data in `public/data/`. Ships pre-configured for XAUUSD/EURUSD/GBPUSD but works
+with any instrument you have 1-minute OHLCV history for (see "Adding your own instrument" below).
 
-## Run it
+## Getting started (0 → running)
+
+**1. Prerequisites** — Node.js 20.11+ and npm (`node -v` to check).
+
+**2. Clone and install:**
 
 ```bash
+git clone <this-repo-url>
 cd trading-journal
 npm install
+```
+
+**3. Provide instrument data.** This repo ships no chart data — raw instrument files are hundreds
+of MB each, too large for git. They live in a sibling `instruments-data/` folder that you create
+yourself, next to your clone:
+
+```
+trading/                    (any parent folder)
+├── trading-journal/        (this repo)
+└── instruments-data/       (you create this — not part of the repo)
+    └── XAUUSD.txt
+```
+
+See **"Adding your own instrument"** below for exactly what that `.txt` file needs to look like —
+the same steps apply whether it's your first instrument or your fifth.
+
+**4. Convert it:**
+
+```bash
+npm run convert-data            # converts XAUUSD, EURUSD, GBPUSD — whichever files exist
+npm run convert-data XAUUSD     # or convert one symbol by name
+```
+
+**5. Run the app:**
+
+```bash
 npm run dev
 ```
 
-Open http://localhost:5173
+Open http://localhost:5173 and pick your instrument from the symbol selector.
 
 ## Pages
 
@@ -30,14 +62,13 @@ Open http://localhost:5173
   see which setups have edge and what mistakes cost you.
 - **Settings** — accounts, session defaults, JSON backup/restore.
 
-## Data
+## Data & simulation notes
 
-See `DATA-NOTES.txt`. Source files: `../instruments-data/<SYMBOL>.txt` — a sibling folder next to
-this project (1-min OHLCV, GMT no DST, **bid** prices). Converted once into binary chunks via:
-
-```bash
-npm run convert-data   # only needed again if a source txt changes; default: XAUUSD EURUSD GBPUSD
-```
+See `DATA-NOTES.txt` for a full data-quality audit of the original XAUUSD/EURUSD/GBPUSD source
+files this project was built against (bar density by year, gap/holiday analysis) — useful context
+if you're sourcing your own data and want to sanity-check it against a known-good baseline.
+`npm run convert-data` only needs to be re-run if a source `.txt` changes or you're adding a new
+instrument.
 
 Simulation details: buys fill at bid + spread (configurable per session); if SL and TP are both
 touched within the same 1-min bar, SL wins (conservative). Commission is charged per lot,
