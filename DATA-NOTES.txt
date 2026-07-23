@@ -1,0 +1,94 @@
+DATASETS
+========
+Three instruments converted for backtesting (same source format, all
+1-min OHLCV, GMT no DST, BID prices, range 2003-05-06 -> 2026-03-31):
+
+  XAUUSD  7,768,795 bars  (1 bad row dropped)   $ math: $100 per $1.00/lot
+  EURUSD  8,557,258 bars  (0 bad rows)          $ math: $10 per pip/lot (100k units)
+  GBPUSD  8,554,328 bars  (9 bad rows dropped)  $ math: $10 per pip/lot (100k units)
+
+Converted 2026-07-16 via: npm run convert-data  (source .txt files in ../instruments-data/)
+The full data-quality audit below was done for XAUUSD; the FX pairs come
+from the same vendor in the same format.
+
+XAUUSD DATA NOTES
+=================
+Source file : instruments-data/XAUUSD.txt, a sibling folder next to trading-journal (478 MB, 7,768,796 rows)
+Instrument  : XAUUSD (Gold spot vs USD)
+Bar size    : 1 minute (OHLC + volume)
+Range       : 2003-05-06 -> 2026-03-31
+Price basis : BID prices
+Timezone    : GMT (no Daylight Saving Time) — all timestamps year-round
+Audited     : 2026-07-14 (full-file gap/continuity audit)
+
+BAR QUALITY BY YEAR
+===================
+"1-min density" = share of consecutive bars exactly 1 minute apart.
+Quiet minutes with no ticks produce no bar (common pre-2006).
+
+Year | Bars    | 1-min density | within 5 min
+-----+---------+---------------+-------------
+2003 | 103,573 |  72.8%        |  91.1%
+2004 | 211,219 |  73.7%        |  96.1%
+2005 | 278,588 |  83.4%        |  98.6%
+2006 | 333,198 |  92.8%        |  99.6%
+2007 | 346,941 |  94.9%        |  99.8%
+2008 | 363,465 |  97.7%        |  99.9%
+2009 | 363,585 |  98.0%        |  99.9%
+2010 | 365,764 |  98.5%        |  99.9%
+2011 | 363,600 |  99.1%        |  99.9%
+2012 | 353,161 |  99.8%        |  99.9%
+2013 | 352,468 |  99.7%        |  99.9%
+2014 | 351,953 |  99.8%        |  99.9%
+2015 | 353,860 |  99.9%        |  99.9%
+2016 | 354,266 |  99.9%        |  99.9%
+2017 | 352,815 |  99.9%        |  99.9%
+2018 | 353,926 |  99.9%        |  99.9%
+2019 | 352,269 |  99.7%        |  99.9%
+2020 | 355,432 |  99.9%        |  99.9%
+2021 | 354,347 |  99.9%        |  99.9%
+2022 | 354,629 |  99.9%        |  99.9%
+2023 | 352,913 |  99.9%        |  99.9%
+2024 | 355,718 |  99.9%        |  99.9%
+2025 | 354,372 |  99.9%        |  99.9%
+2026 |  86,734 |  99.9%        |  99.9%   (through Mar 31)
+
+ERA SUMMARY
+===========
+2003-2005 : Sparse era. 73-83% 1-min density; quiet minutes often have no
+            bar. Usable, but 1-min charts look "chunkier". Fine for 5m+.
+2006-2011 : Very good. 93-99% density; solid for 1-min backtesting.
+2012-2026 : Excellent. 99.7-99.9% density — effectively perfect 1-min
+            data. Best era for precise 1-min entries/exits (14+ years).
+
+GAPS = MARKET CLOSURES, NOT MISSING DATA
+========================================
+- Weekends: gold closes Fri ~21:58 GMT, reopens Sun ~22:00/23:00 GMT.
+  All 1,195 weekend gaps match this pattern. Normal.
+- Daily settlement break: ~1h gap every trading day around 21:58-23:00 GMT
+  (recent years). Normal.
+- US holidays / half-days: larger weekday gaps land exactly on Christmas
+  Eve, New Year's Eve, Thanksgiving, MLK Day, Presidents Day, Memorial
+  Day, July 4th, Labor Day. Normal.
+- Fully missing weekdays: only 20 in 23 years, all market holidays
+  (Good Friday, Christmas Day, New Year's Day):
+  2012-04-06, 2013-03-29, 2013-12-25, 2014-04-18, 2015-04-03, 2015-12-25,
+  2016-01-01, 2016-03-25, 2017-04-14, 2018-03-30, 2019-04-19, 2020-04-10,
+  2020-12-25, 2021-01-01, 2021-04-02, 2021-12-24, 2022-04-15, 2023-04-07,
+  2024-03-29, 2025-04-18
+  => Zero real trading days missing.
+
+KNOWN DEFECTS
+=============
+- Exactly one out-of-order timestamp: 2004-04-30 (a row jumps back to
+  00:00 after 11:56). The app's import step drops/fixes this row.
+  Only data error found in 7.77M rows.
+
+IMPLICATIONS FOR THE APP
+========================
+- Store/display timestamps as GMT; no DST conversion needed at import.
+- Prices are Bid: real spread means Ask entries fill slightly higher.
+  Consider a configurable spread (e.g. 20-40 cents) applied to buys/SL/TP
+  touches for realism in the replay engine.
+- Replay skips market closures seamlessly (like TradingView replay);
+  optional "market closed" marker when crossing a gap.

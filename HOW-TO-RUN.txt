@@ -1,0 +1,64 @@
+HOW TO RUN YOUR TRADING JOURNAL / BACKTESTER
+============================================
+
+EASIEST WAY (double-click)
+--------------------------
+1. Open the trading-journal folder
+2. Double-click:  start-backtesting.command
+   (first time only: if macOS blocks it, right-click it > Open > Open)
+3. A Terminal window opens and starts the app, and your browser
+   opens http://localhost:5173 automatically
+4. When you're done: close the browser tab, then in that Terminal
+   window press  Ctrl + C  (or just close the Terminal window)
+
+MANUAL WAY (Terminal)
+---------------------
+1. Open the Terminal app
+2. Type (from wherever you cloned/placed the trading-journal folder):
+       cd trading-journal
+       npm run dev
+3. Open your browser at:  http://localhost:5173
+4. To stop the app: press  Ctrl + C  in the Terminal
+
+WHERE YOUR DATA LIVES
+---------------------
+- Every trade/journal change is AUTOMATICALLY saved (a few seconds later)
+  to a file in this folder:   trading-journal/data-journal/journal.json
+  plus one dated copy per day (last 14 days kept). That folder is the
+  permanent home of your data — back it up like any normal file.
+- The app also keeps a fast working copy inside the browser. If that is
+  ever empty (you cleared browser data, or opened a different browser),
+  the app automatically restores everything from data-journal on startup.
+- You can check it anytime: Settings page > "Folder sync" shows when the
+  last save happened, plus a "Save to folder now" button.
+
+GOOD TO KNOW
+------------
+- The app runs 100% on your Mac. No internet needed, nothing is uploaded.
+- Auto-save to the folder only works while the app is running (it is the
+  app that writes the file) — which is the only time data can change anyway.
+- A backtest SESSION does not survive stopping the app: closed trades are
+  already saved, but an open position and chart drawings are gone next
+  time. Close positions before quitting if you want them journaled.
+- Use the same URL every time: http://localhost:5173
+
+IF SOMETHING LOOKS WRONG
+------------------------
+- "This site can't be reached"  ->  the app isn't running; start it again
+- Chart says data is missing    ->  in Terminal run:
+       cd trading-journal && npm run convert-data
+  (rebuilds chart data from ../instruments-data/*.txt — takes ~1 minute;
+   only ever needed if the public/data folder was deleted or you added a
+   new instrument — see README.md > "Adding your own instrument")
+- Port already in use           ->  an old copy is still running; run:
+       lsof -ti:5173 | xargs kill
+  then start it again
+
+QUICK REMINDERS (inside the app)
+--------------------------------
+- Backtest page: space = play/pause · -> = step one candle · up/down = speed
+- Draw on chart: toolbar at the chart's left edge; double-click a drawing
+  to write text in it; Del removes the selected drawing
+- "f Indicators" button: add MAs / Bollinger / VWAP / RSI / MACD;
+  your Sessions killzones are under the "Custom" tab
+- All chart times are GMT (your killzones were converted from Dubai time)

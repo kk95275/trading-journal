@@ -1,0 +1,7 @@
+node_modules/
+dist/
+public/data/
+data-journal/
+.DS_Store
+.env
+.env.local

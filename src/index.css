@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-page text-ink2 antialiased;
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #383835; border-radius: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+}
+
+@layer components {
+  .card { @apply bg-surface rounded-xl border border-white/10 p-4; }
+  .btn { @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed; }
+  .btn-primary { @apply btn bg-accent text-white hover:bg-accent/85; }
+  .btn-ghost { @apply btn bg-white/5 text-ink2 hover:bg-white/10 border border-white/10; }
+  .btn-up { @apply btn bg-up text-white hover:bg-up/85; }
+  .btn-down { @apply btn bg-down text-white hover:bg-down/85; }
+  .input { @apply w-full rounded-lg bg-page border border-white/10 px-2.5 py-1.5 text-sm text-ink placeholder-muted focus:outline-none focus:border-accent; }
+  .label { @apply block text-xs text-muted mb-1; }
+  .th { @apply text-left text-xs font-medium text-muted px-3 py-2 border-b border-hairline whitespace-nowrap; }
+  .td { @apply px-3 py-2 text-sm border-b border-grid whitespace-nowrap; }
+  .tab { @apply px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer transition-colors; }
+  .tab-on { @apply bg-accent text-white; }
+  .tab-off { @apply bg-white/5 text-ink2 hover:bg-white/10; }
+}
