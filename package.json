@@ -2,6 +2,11 @@
   "name": "trading-journal",
   "private": true,
   "version": "1.0.0",
+  "description": "Local-first trading journal + bar-replay backtester",
+  "author": {
+    "name": "Karim Khalil",
+    "email": "karimtkhalil2004@gmail.com"
+  },
   "type": "module",
   "main": "dist-electron/main.cjs",
   "scripts": {
