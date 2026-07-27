@@ -150,6 +150,22 @@ export default function SessionsLayer({ container, chart, series, engine, getBar
     }
   }, [chart, container, engine, redraw])
 
+  // See DrawingLayer.tsx's identical effect: lightweight-charts' price scale has no
+  // change-subscription API, so a price-axis drag never fires a redraw on its own.
+  useEffect(() => {
+    let raf: number | null = null
+    const loop = () => { redraw(); raf = requestAnimationFrame(loop) }
+    const onPointerDown = () => { if (raf === null) raf = requestAnimationFrame(loop) }
+    const onPointerUp = () => { if (raf !== null) { cancelAnimationFrame(raf); raf = null } }
+    window.addEventListener('pointerdown', onPointerDown, true)
+    window.addEventListener('pointerup', onPointerUp, true)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown, true)
+      window.removeEventListener('pointerup', onPointerUp, true)
+      if (raf !== null) cancelAnimationFrame(raf)
+    }
+  }, [redraw])
+
   useEffect(() => { redraw() }, [dataVersion, config, redraw])
   useEffect(() => { onCanvas(canvasRef.current); return () => onCanvas(null) }, [onCanvas])
 

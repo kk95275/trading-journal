@@ -31,4 +31,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on(`${channel}:error`, (_e, err: string) => { cleanup(); reject(new Error(err)) })
       ipcRenderer.send('instruments:import', { ...args, channel })
     }),
+
+  getAppVersion: () => ipcRenderer.invoke('app:version'),
+  checkForUpdates: () => ipcRenderer.invoke('updater:check'),
+  installUpdate: () => ipcRenderer.invoke('updater:install'),
+  onUpdaterStatus: (cb: (status: unknown) => void) => {
+    const listener = (_e: unknown, status: unknown) => cb(status)
+    ipcRenderer.on('updater:status', listener)
+    return () => ipcRenderer.removeListener('updater:status', listener)
+  },
 })

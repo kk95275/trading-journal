@@ -40,6 +40,18 @@ export interface Platform {
   importInstrument(args: ImportInstrumentArgs, onProgress: (rows: number, monthKey: string) => void): Promise<ConvertResult>
 }
 
+// Electron-only — no web/browser-tab equivalent of "check for an app update" — so this
+// lives outside the Platform interface. See src/lib/updater.ts for the isElectron-gated
+// consumer of these same window.electronAPI methods.
+export type UpdaterStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'available'; version: string }
+  | { state: 'downloading'; percent: number }
+  | { state: 'downloaded'; version: string }
+  | { state: 'not-available' }
+  | { state: 'error'; message: string }
+
 declare global {
   interface Window {
     electronAPI?: {
@@ -55,6 +67,10 @@ declare global {
         args: { symbol: string; filePath: string; spec: SymbolSpec },
         onProgress: (rows: number, monthKey: string) => void,
       ): Promise<ConvertResult>
+      getAppVersion(): Promise<string>
+      checkForUpdates(): Promise<void>
+      installUpdate(): Promise<void>
+      onUpdaterStatus(cb: (status: UpdaterStatus) => void): () => void
     }
   }
 }

@@ -5,6 +5,7 @@ import type { AccountKind } from '../lib/types'
 import { fmtUsd } from '../lib/gold'
 import { onSyncChange, syncNow, syncStatus } from '../lib/sync'
 import { isElectron } from '../lib/platform'
+import { checkForUpdates, getAppVersion, installUpdate, useUpdaterStatus } from '../lib/updater'
 import { Modal, PageHead } from '../components/ui'
 import InstrumentsCard from '../components/InstrumentsCard'
 
@@ -155,6 +156,7 @@ export default function Settings() {
         </div>
 
         <SyncCard />
+        {isElectron && <UpdatesCard />}
 
         <div className="card space-y-3">
           <h3 className="text-sm font-semibold text-ink">Manual backup</h3>
@@ -209,6 +211,46 @@ function SyncCard() {
         </span>
         {s.restored && <span className="text-warn">restored from folder on startup</span>}
         <button className="btn-ghost text-xs ml-auto" onClick={() => void syncNow()}>Save to folder now</button>
+      </div>
+    </div>
+  )
+}
+
+function UpdatesCard() {
+  const status = useUpdaterStatus()
+  const [version, setVersion] = useState<string | null>(null)
+  useEffect(() => { void getAppVersion().then(setVersion) }, [])
+
+  const statusText = () => {
+    switch (status.state) {
+      case 'checking': return '● checking for updates…'
+      case 'available': return `● update available (v${status.version}) — downloading…`
+      case 'downloading': return `● downloading update… ${status.percent}%`
+      case 'downloaded': return `● update ready (v${status.version})`
+      case 'not-available': return '● up to date'
+      case 'error': return `● couldn't check for updates`
+      default: return '● not checked yet'
+    }
+  }
+
+  return (
+    <div className="card space-y-2">
+      <h3 className="text-sm font-semibold text-ink">Updates</h3>
+      <p className="text-xs text-muted">
+        {version ? <>Running version <span className="text-ink2">{version}</span>.</> : null}{' '}
+        Checked automatically on startup.
+      </p>
+      <div className="flex items-center gap-3 text-xs">
+        <span className={status.state === 'error' ? 'text-down' : status.state === 'downloaded' ? 'text-up' : 'text-ink2'}>
+          {statusText()}
+        </span>
+        {status.state === 'downloaded' ? (
+          <button className="btn-primary text-xs ml-auto" onClick={() => void installUpdate()}>Restart to install</button>
+        ) : (
+          <button className="btn-ghost text-xs ml-auto" onClick={() => void checkForUpdates()} disabled={status.state === 'checking'}>
+            Check for updates
+          </button>
+        )}
       </div>
     </div>
   )

@@ -8,8 +8,18 @@
 // CJS keeps require()-based Electron APIs simple). The shared *.mjs libs are pure ESM,
 // loaded here via dynamic import() — a .cjs file can't require() an ESM module.
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+import { autoUpdater } from 'electron-updater'
 import fs from 'node:fs'
 import path from 'node:path'
+
+type UpdaterStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'available'; version: string }
+  | { state: 'downloading'; percent: number }
+  | { state: 'downloaded'; version: string }
+  | { state: 'not-available' }
+  | { state: 'error'; message: string }
 
 // In dev (unpackaged), read/write the same repo-relative data-journal/ and public/data/
 // the plain browser dev workflow already uses — so testing via `npm run electron:dev`
@@ -60,6 +70,8 @@ async function registerIpc() {
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) // plain ArrayBuffer, matches dataService's parseChunk(buf: ArrayBuffer)
   })
 
+  ipcMain.handle('app:version', () => app.getVersion())
+
   ipcMain.handle('instruments:list', () => instrumentsRepo.listInstruments(instrumentsDir))
   ipcMain.handle('instruments:delete', (_e, symbol: string) => {
     if (!SYMBOL_RE.test(symbol)) throw new Error('bad symbol')
@@ -89,6 +101,36 @@ async function registerIpc() {
   })
 }
 
+// Auto-update: checks GitHub Releases (via the app-update.yml electron-builder generates
+// at package time from package.json's `build.publish` config — no separate config needed
+// here). Downloads in the background automatically, but never force-installs: the user
+// must click "Restart to install" in Settings, so a download completing mid-backtest
+// never yanks the app out from under them. Only wired when packaged — an unpackaged dev
+// run has no app-update.yml and checkForUpdates() would just error.
+function registerUpdater(win: BrowserWindow) {
+  if (!app.isPackaged) return
+
+  const send = (status: UpdaterStatus) => { if (!win.isDestroyed()) win.webContents.send('updater:status', status) }
+
+  autoUpdater.autoDownload = true
+  autoUpdater.on('checking-for-update', () => send({ state: 'checking' }))
+  autoUpdater.on('update-available', info => send({ state: 'available', version: info.version }))
+  autoUpdater.on('update-not-available', () => send({ state: 'not-available' }))
+  autoUpdater.on('download-progress', p => send({ state: 'downloading', percent: Math.round(p.percent) }))
+  autoUpdater.on('update-downloaded', info => send({ state: 'downloaded', version: info.version }))
+  // Failures here are expected/routine (private repo, offline, etc.) — never let one
+  // crash the app or surface as anything more than a status line in Settings.
+  autoUpdater.on('error', err => {
+    console.error('autoUpdater error:', err) // full detail in the main-process log, not the UI
+    send({ state: 'error', message: String(err?.message ?? err).split('\n')[0].slice(0, 200) })
+  })
+
+  ipcMain.handle('updater:check', () => autoUpdater.checkForUpdates().catch(() => {}))
+  ipcMain.handle('updater:install', () => autoUpdater.quitAndInstall())
+
+  setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}) }, 5000)
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1400,
@@ -102,6 +144,7 @@ function createWindow() {
   })
   if (app.isPackaged) void win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   else void win.loadURL('http://localhost:5173')
+  registerUpdater(win)
 }
 
 void app.whenReady().then(async () => {

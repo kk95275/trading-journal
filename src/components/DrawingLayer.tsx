@@ -400,6 +400,24 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     }
   }, [chart, container, engine, redraw])
 
+  // lightweight-charts' price scale has no change-subscription API at all, so dragging
+  // the right-hand axis to rescale vertically (or any other future scale-changing
+  // gesture) never fires a redraw on its own — keep repainting every frame while any
+  // pointer button is held down anywhere, so drawings never visibly detach mid-drag.
+  useEffect(() => {
+    let raf: number | null = null
+    const loop = () => { redraw(); raf = requestAnimationFrame(loop) }
+    const onPointerDown = () => { if (raf === null) raf = requestAnimationFrame(loop) }
+    const onPointerUp = () => { if (raf !== null) { cancelAnimationFrame(raf); raf = null } }
+    window.addEventListener('pointerdown', onPointerDown, true)
+    window.addEventListener('pointerup', onPointerUp, true)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown, true)
+      window.removeEventListener('pointerup', onPointerUp, true)
+      if (raf !== null) cancelAnimationFrame(raf)
+    }
+  }, [redraw])
+
   useEffect(() => { redraw() }, [dataVersion, selectedId, tool, redraw])
   useEffect(() => { onCanvas(canvasRef.current); return () => onCanvas(null) }, [onCanvas])
   useEffect(() => {
