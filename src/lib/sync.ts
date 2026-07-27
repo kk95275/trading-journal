@@ -1,9 +1,11 @@
-// Folder sync: mirrors the browser database (IndexedDB) to
-// trading-journal/data-journal/journal.json via the dev server, debounced
-// after every change. On startup, if the browser database is empty but the
-// folder has data (browser wiped, or a different browser), it auto-restores.
+// Folder sync: mirrors the browser database (IndexedDB) to local storage — a
+// data-journal/journal.json file via the dev server, or the OS user-data dir via
+// Electron IPC (see platform.ts) — debounced after every change. On startup, if the
+// browser database is empty but storage has data (browser wiped, or a different
+// browser), it auto-restores.
 import { db } from '../db'
 import type { Trade } from './types'
+import { platform } from './platform'
 
 export interface SyncStatus {
   lastSavedAt: number | null
@@ -78,15 +80,7 @@ export async function syncNow() {
   emit()
   try {
     const snap = await buildSnapshot()
-    const res = await fetch('/api/journal', {
-      method: 'PUT',
-      headers: {
-        'content-type': 'application/json',
-        'x-journal-meta': JSON.stringify({ exportedAt: snap.exportedAt, trades: snap.trades.length, accounts: snap.accounts.length }),
-      },
-      body: JSON.stringify(snap),
-    })
-    if (!res.ok) throw new Error(`save failed (${res.status})`)
+    await platform.putJournal(snap, { exportedAt: snap.exportedAt, trades: snap.trades.length, accounts: snap.accounts.length })
     syncStatus.lastSavedAt = Date.now()
     syncStatus.error = ''
   } catch (e: any) {
@@ -110,14 +104,11 @@ export async function initSync() {
   try {
     const counts = await Promise.all([db.trades.count(), db.accounts.count(), db.journal.count(), db.setups.count()])
     if (counts.every(c => c === 0)) {
-      const res = await fetch('/api/journal')
-      if (res.ok) {
-        const p = await res.json()
-        if (p && (p.trades?.length || p.accounts?.length || p.journal?.length || p.setups?.length)) {
-          await applySnapshot(p)
-          syncStatus.restored = true
-          emit()
-        }
+      const p = await platform.getJournal()
+      if (p && (p.trades?.length || p.accounts?.length || p.journal?.length || p.setups?.length)) {
+        await applySnapshot(p)
+        syncStatus.restored = true
+        emit()
       }
     }
   } catch { /* server storage unavailable — app still works from the browser db */ }

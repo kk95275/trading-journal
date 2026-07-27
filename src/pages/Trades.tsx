@@ -3,7 +3,8 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { db } from '../db'
 import type { Direction, Trade } from '../lib/types'
 import { fmtDateTime, fmtDuration, fmtR, fmtUsd, pnlUsd, riskUsd } from '../lib/gold'
-import { fmtPx, SYMBOL_LIST } from '../lib/symbols'
+import { fmtPx } from '../lib/symbols'
+import { useSymbolList } from '../lib/instruments'
 import { Empty, Modal, PageHead, PnlText } from '../components/ui'
 import { useAccountFilter } from '../components/useAccountFilter'
 
@@ -182,6 +183,7 @@ function Info({ label, value, tone }: { label: string; value: string; tone?: 'up
 /* ---------------- manual add ---------------- */
 
 function AddTrade({ accounts, onClose }: { accounts: { id?: number; name: string }[]; onClose: () => void }) {
+  const SYMBOL_LIST = useSymbolList()
   const [f, setF] = useState({
     accountId: accounts[0]?.id ?? 0, symbol: 'XAUUSD', direction: 'long' as Direction, lots: 0.1,
     entryTime: '', exitTime: '', entryPrice: '', exitPrice: '', sl: '', fees: '0', notes: '',

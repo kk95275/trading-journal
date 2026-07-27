@@ -3,7 +3,9 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { db, getSetting, setSetting } from '../db'
 import type { Confirmation, Direction, Trade } from '../lib/types'
 import { fmtDateTime, fmtR, fmtUsd, riskUsd } from '../lib/gold'
-import { fmtPx, specFor, SYMBOL_LIST } from '../lib/symbols'
+import { fmtPx, specFor } from '../lib/symbols'
+import { useSymbolList } from '../lib/instruments'
+import { isElectron } from '../lib/platform'
 import { getManifest } from '../data/dataService'
 import { ReplayEngine, getActiveEngine, setActiveEngine, type OpenPosition, type SessionConfig } from '../replay/engine'
 import { defaultSessionsConfig, type SessionsConfig } from '../replay/sessions'
@@ -20,6 +22,8 @@ const DEFAULT_TFS: TfDef[] = [
   { label: '1m', sec: 60 }, { label: '5m', sec: 300 }, { label: '15m', sec: 900 },
   { label: '1h', sec: 3600 }, { label: '4h', sec: 14400 }, { label: '1d', sec: 86400 },
 ]
+
+const fmtMonth = (s: number) => new Date(s * 1000).toISOString().slice(0, 7)
 
 function parseTfLabel(s: string): TfDef | null {
   const m = s.trim().toLowerCase().match(/^(\d+)\s*(m|h|d|w)$/)
@@ -51,6 +55,7 @@ export default function Backtest() {
 
 function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
   const accounts = useLiveQuery(() => db.accounts.where('kind').equals('backtest').toArray(), [], [])
+  const SYMBOL_LIST = useSymbolList()
   const [accountId, setAccountId] = useState<number | 'new'>('new')
   const [newName, setNewName] = useState('Backtest 1')
   const [symbol, setSymbol] = useState('XAUUSD')
@@ -65,23 +70,31 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    // detect which symbols have converted data
+    // detect which symbols have converted data — re-runs whenever the instrument list
+    // changes (e.g. right after importing one in Settings) so it's selectable immediately.
     void Promise.allSettled(SYMBOL_LIST.map(s => getManifest(s).then(m => [s, { from: m.from, to: m.to }] as const))).then(results => {
       const r: Record<string, { from: number; to: number }> = {}
       for (const res of results) if (res.status === 'fulfilled') r[res.value[0]] = res.value[1]
       setRanges(r)
-      if (!Object.keys(r).length) setError('No chart data found — run: npm run convert-data')
+      if (!Object.keys(r).length) {
+        setError(isElectron ? 'No chart data yet — add an instrument in Settings → Instruments' : 'No chart data found — run: npm run convert-data')
+      }
     })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [SYMBOL_LIST])
+
+  useEffect(() => {
     void getSetting('sessionDefaults', null).then((d: any) => {
       if (!d) return
       setCommission(d.commission ?? 6)
       setBalance(d.balance ?? 10000)
       const sbs = d.spreadBySymbol ?? (d.spread !== undefined ? { XAUUSD: d.spread } : {})
       setSpreadBySymbol(sbs)
-      const sym = d.lastSymbol && SYMBOL_LIST.includes(d.lastSymbol) ? d.lastSymbol : 'XAUUSD'
+      const sym = d.lastSymbol && SYMBOL_LIST.includes(d.lastSymbol) ? d.lastSymbol : (SYMBOL_LIST[0] ?? 'XAUUSD')
       setSymbol(sym)
       setSpread(sbs[sym] ?? specFor(sym).defaultSpread)
     })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const pickSymbol = (s: string) => {
@@ -121,7 +134,9 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
         accName = accounts?.find(a => a.id === accId)?.name ?? 'Backtest'
       }
       const startTs = Date.parse(`${date}T${time || '08:00'}:00Z`) / 1000
-      if (range && (startTs < range.from || startTs > range.to)) throw new Error('Start date is outside the data range (2003-05 → 2026-03).')
+      if (range && (startTs < range.from || startTs > range.to)) {
+        throw new Error(`Start date is outside the data range (${fmtMonth(range.from)} → ${fmtMonth(range.to)}).`)
+      }
       const config: SessionConfig = { accountId: accId, accountName: accName, symbol, startTs, spread, commissionPerLot: commission, startingBalance: balance }
       await setSetting('sessionDefaults', {
         lastSymbol: symbol,
@@ -141,7 +156,7 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
     <div className="flex items-center justify-center h-full p-6">
       <div className="card w-full max-w-md">
         <h1 className="text-lg font-semibold text-ink mb-1">New backtest session</h1>
-        <p className="text-xs text-muted mb-4">1-min data · 2003-05 → 2026-03 · GMT · bid prices</p>
+        <p className="text-xs text-muted mb-4">1-min data · {range ? `${fmtMonth(range.from)} → ${fmtMonth(range.to)}` : '—'} · GMT · bid prices</p>
         <div className="space-y-3">
           <div>
             <label className="label">Instrument</label>

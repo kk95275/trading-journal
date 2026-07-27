@@ -1,8 +1,14 @@
 HOW TO RUN YOUR TRADING JOURNAL / BACKTESTER
 ============================================
 
-EASIEST WAY (double-click)
---------------------------
+EASIEST WAY OF ALL: download the app
+-------------------------------------
+There's now a real installer for Mac/Windows/Linux — see README.md > "Install".
+No Terminal, no Node.js needed. Everything below is for running from the
+source code instead (e.g. if you're developing the app).
+
+EASIEST WAY (double-click, from source)
+----------------------------------------
 1. Open the trading-journal folder
 2. Double-click:  start-backtesting.command
    (first time only: if macOS blocks it, right-click it > Open > Open)
@@ -45,11 +51,12 @@ GOOD TO KNOW
 IF SOMETHING LOOKS WRONG
 ------------------------
 - "This site can't be reached"  ->  the app isn't running; start it again
-- Chart says data is missing    ->  in Terminal run:
+- Chart says data is missing    ->  easiest: Settings page > "Instruments" >
+       "+ Add instrument" in the app itself. Or in Terminal run:
        cd trading-journal && npm run convert-data
   (rebuilds chart data from ../instruments-data/*.txt — takes ~1 minute;
    only ever needed if the public/data folder was deleted or you added a
-   new instrument — see README.md > "Adding your own instrument")
+   new instrument — see README.md > "Adding an instrument")
 - Port already in use           ->  an old copy is still running; run:
        lsof -ti:5173 | xargs kill
   then start it again

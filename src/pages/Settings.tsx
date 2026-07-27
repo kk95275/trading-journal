@@ -4,7 +4,9 @@ import { db, getSetting, setSetting } from '../db'
 import type { AccountKind } from '../lib/types'
 import { fmtUsd } from '../lib/gold'
 import { onSyncChange, syncNow, syncStatus } from '../lib/sync'
+import { isElectron } from '../lib/platform'
 import { Modal, PageHead } from '../components/ui'
+import InstrumentsCard from '../components/InstrumentsCard'
 
 export default function Settings() {
   const accounts = useLiveQuery(() => db.accounts.toArray(), [], [])
@@ -131,6 +133,8 @@ export default function Settings() {
           )}
         </div>
 
+        <InstrumentsCard />
+
         <div className="card space-y-3">
           <h3 className="text-sm font-semibold text-ink">Backtest session defaults</h3>
           <div className="grid grid-cols-3 gap-3">
@@ -170,7 +174,6 @@ export default function Settings() {
         </div>
 
         {msg && <div className="text-xs text-warn">{msg}</div>}
-        <p className="text-[11px] text-muted">Datasets: XAUUSD · EURUSD · GBPUSD — 1-min · 2003-05 → 2026-03 · GMT (no DST) · bid prices · see DATA-NOTES.txt</p>
       </div>
       {adding && <AddAccount onClose={() => setAdding(false)} />}
     </div>
@@ -190,7 +193,11 @@ function SyncCard() {
     <div className="card space-y-2">
       <h3 className="text-sm font-semibold text-ink">Folder sync (automatic)</h3>
       <p className="text-xs text-muted">
-        Every change is saved to <span className="text-ink2">trading-journal/data-journal/journal.json</span> (plus a daily copy, last 14 kept).
+        Every change is saved to{' '}
+        {isElectron
+          ? <span className="text-ink2">your app data folder</span>
+          : <span className="text-ink2">trading-journal/data-journal/journal.json</span>}
+        {' '}(plus a daily copy, last 14 kept).
         If the browser's storage is ever empty — cleared data or a different browser — the app restores from that file on startup.
       </p>
       <div className="flex items-center gap-3 text-xs">

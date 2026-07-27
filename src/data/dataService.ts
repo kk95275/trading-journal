@@ -1,25 +1,16 @@
-// Loads the chunked binary bar data produced by scripts/convert-data.mjs,
-// per symbol (public/data/<SYMBOL>/...).
+// Loads the chunked binary bar data produced by scripts/convert-data.mjs (or the in-app
+// Instruments importer), per symbol. Reads go through src/lib/platform.ts so this file
+// doesn't care whether it's running in a browser tab (fetch) or Electron (IPC).
 // Format per bar (24 bytes LE): uint32 epochSeconds, float32 o, h, l, c, v.
 import type { Bar } from '../lib/types'
+import { platform, type Chunk, type Manifest } from '../lib/platform'
 
+export type { Manifest }
 export type TfName = '1m' | '5m' | '15m' | '1h' | '4h' | '1d'
 export const TF_SECONDS: Record<TfName, number> = {
   '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400,
 }
 export const TF_LIST: TfName[] = ['1m', '5m', '15m', '1h', '4h', '1d']
-
-interface Chunk { file: string; from: number; to: number; bars: number }
-export interface Manifest {
-  symbol: string
-  priceBasis: string
-  timezone: string
-  barBytes: number
-  from: number
-  to: number
-  rows: number
-  timeframes: Record<string, { chunks: Chunk[] }>
-}
 
 const BAR_BYTES = 24
 
@@ -31,14 +22,16 @@ const MAX_1M_CHUNKS = 40
 export function getManifest(symbol: string): Promise<Manifest> {
   let p = manifestPromises.get(symbol)
   if (!p) {
-    p = fetch(`/data/${symbol}/manifest.json`).then(r => {
-      if (!r.ok) throw new Error(`No data for ${symbol} — run: npm run convert-data`)
-      return r.json()
-    })
+    p = platform.getManifest(symbol)
     p.catch(() => manifestPromises.delete(symbol)) // don't cache failures
     manifestPromises.set(symbol, p)
   }
   return p
+}
+
+/** Drop a cached manifest so the next getManifest() re-fetches — call after import/delete. */
+export function invalidateManifest(symbol: string): void {
+  manifestPromises.delete(symbol)
 }
 
 function parseChunk(buf: ArrayBuffer): Bar[] {
@@ -63,9 +56,7 @@ async function loadChunk(symbol: string, chunk: Chunk): Promise<Bar[]> {
   const key = `${symbol}/${chunk.file}`
   const cached = chunkCache.get(key)
   if (cached) return cached
-  const res = await fetch(`/data/${symbol}/${chunk.file}`)
-  if (!res.ok) throw new Error(`Failed to load ${key}`)
-  const bars = parseChunk(await res.arrayBuffer())
+  const bars = parseChunk(await platform.getChunk(symbol, chunk.file))
   chunkCache.set(key, bars)
   if (chunk.file.startsWith('1m/')) {
     chunkOrder.push(key)

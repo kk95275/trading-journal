@@ -1,6 +1,8 @@
 import { useEffect } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { initSync } from './lib/sync'
+import { refreshInstruments } from './lib/instruments'
+import { isElectron } from './lib/platform'
 import Backtest from './pages/Backtest'
 import Dashboard from './pages/Dashboard'
 import Trades from './pages/Trades'
@@ -20,13 +22,13 @@ const NAV = [
 ]
 
 export default function App() {
-  useEffect(() => { void initSync() }, [])
+  useEffect(() => { void initSync(); void refreshInstruments() }, [])
   return (
     <div className="flex h-full">
       <aside className="w-52 shrink-0 border-r border-hairline bg-surface flex flex-col">
         <div className="px-4 py-4 border-b border-hairline">
           <div className="text-ink font-semibold leading-tight">Trading Journal</div>
-          <div className="text-[11px] text-muted mt-0.5">XAU · EUR · GBP / USD · GMT</div>
+          <div className="text-[11px] text-muted mt-0.5">Bar-replay backtester</div>
         </div>
         <nav className="p-2 space-y-0.5 flex-1">
           {NAV.map(n => (
@@ -45,7 +47,7 @@ export default function App() {
           ))}
         </nav>
         <div className="px-4 py-3 text-[11px] text-muted border-t border-hairline">
-          Local only · auto-saved to the data-journal folder
+          {isElectron ? 'Local only · auto-saved to your app data folder' : 'Local only · auto-saved to the data-journal folder'}
         </div>
       </aside>
       <main className="flex-1 overflow-auto">

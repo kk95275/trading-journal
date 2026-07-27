@@ -3,11 +3,16 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "main": "dist-electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "convert-data": "node scripts/convert-data.mjs"
+    "convert-data": "node scripts/convert-data.mjs",
+    "electron:compile": "tsc -p electron/tsconfig.json",
+    "electron:dev": "npm run electron:compile && concurrently -k -n VITE,ELECTRON \"vite\" \"wait-on tcp:5173 && electron .\"",
+    "electron:build": "npm run build && npm run electron:compile && electron-builder --publish never",
+    "release": "npm run build && npm run electron:compile && electron-builder --publish always"
   },
   "dependencies": {
     "dexie": "^4.0.8",
@@ -23,9 +28,79 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
+    "concurrently": "^9.2.4",
+    "electron": "^41.7.1",
+    "electron-builder": "^26.15.3",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
     "typescript": "~5.6.3",
-    "vite": "^6.0.3"
+    "vite": "^6.0.3",
+    "wait-on": "^9.1.0"
+  },
+  "build": {
+    "appId": "com.karim.tradingjournal",
+    "productName": "Trading Journal",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/data/**",
+      "dist-electron/**/*",
+      "scripts/lib/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "scripts/lib/**/*"
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.finance",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Office"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "kk95275",
+      "repo": "trading-journal"
+    }
   }
 }
