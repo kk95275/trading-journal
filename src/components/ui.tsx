@@ -45,3 +45,69 @@ export function Modal({ title, onClose, children, wide }: { title: string; onClo
 export function Empty({ text }: { text: string }) {
   return <div className="card text-center text-sm text-muted py-10">{text}</div>
 }
+
+const GRADE_CONFIG: Record<string, { bg: string; text: string; label: string }> = {
+  A: { bg: 'bg-up/15',     text: 'text-up',     label: 'A — Perfect'  },
+  B: { bg: 'bg-accent/15', text: 'text-accent',  label: 'B — Good'     },
+  C: { bg: 'bg-warn/15',   text: 'text-warn',    label: 'C — Average'  },
+  D: { bg: 'bg-down/15',   text: 'text-down',    label: 'D — Poor'     },
+}
+
+export function GradeBadge({ grade, showLabel }: { grade: string; showLabel?: boolean }) {
+  const c = GRADE_CONFIG[grade] ?? { bg: 'bg-white/5', text: 'text-muted', label: grade }
+  return (
+    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-bold ${c.bg} ${c.text}`}>
+      {showLabel ? c.label : grade}
+    </span>
+  )
+}
+
+export function GradePicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="flex gap-1.5">
+      {Object.entries(GRADE_CONFIG).map(([key, c]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => onChange(value === key ? '' : key)}
+          className={`flex flex-col items-center px-3 py-1.5 rounded-lg border text-center transition-colors ${
+            value === key ? 'border-accent/60 bg-accent/10' : 'border-hairline hover:border-white/25'
+          }`}
+        >
+          <span className={`text-sm font-bold ${c.text}`}>{key}</span>
+          <span className="text-[10px] text-muted leading-tight">{c.label.split(' — ')[1]}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+const EMOTIONS_BEFORE = ['Fearful', 'Anxious', 'Neutral', 'Confident', 'Overconfident']
+const EMOTIONS_AFTER  = ['Angry', 'Disappointed', 'Neutral', 'Satisfied', 'Euphoric']
+
+export function emotionLabel(v: number | undefined, type: 'before' | 'after'): string {
+  if (!v) return '—'
+  return (type === 'before' ? EMOTIONS_BEFORE : EMOTIONS_AFTER)[v - 1] ?? '—'
+}
+
+export function EmotionPicker({ value, onChange, type }: { value: number | undefined; onChange: (v: number | undefined) => void; type: 'before' | 'after' }) {
+  const labels = type === 'before' ? EMOTIONS_BEFORE : EMOTIONS_AFTER
+  return (
+    <div className="flex flex-wrap gap-1">
+      {labels.map((label, i) => (
+        <button
+          key={i}
+          type="button"
+          onClick={() => onChange(value === i + 1 ? undefined : i + 1)}
+          className={`text-xs px-2 py-1 rounded-md border transition-colors ${
+            value === i + 1
+              ? 'border-accent/60 bg-accent/10 text-ink'
+              : 'border-hairline text-muted hover:border-white/25 hover:text-ink2'
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+}

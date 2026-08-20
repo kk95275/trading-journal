@@ -50,15 +50,17 @@ export default function Dashboard() {
         <div className="px-6"><Empty text="No trades yet — run a backtest session and your stats will appear here." /></div>
       ) : (
         <div className="px-6 space-y-4">
-          <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-4 gap-3">
             <StatCard label="Net P&L" value={fmtUsd(s.netPnl, 0)} tone={s.netPnl > 0 ? 'up' : s.netPnl < 0 ? 'down' : 'none'} hint={`${s.n} trades`} />
             <StatCard label="Win rate" value={fmtPct(s.winRate)} hint={`${s.wins}W · ${s.losses}L${s.breakeven ? ` · ${s.breakeven}BE` : ''}`} />
-            <StatCard label="Profit factor" value={isFinite(s.profitFactor) ? s.profitFactor.toFixed(2) : '∞'} hint={`${fmtUsd(s.grossWin, 0)} / ${fmtUsd(s.grossLoss, 0)}`} />
+            <StatCard label="Profit factor" value={isFinite(s.profitFactor) ? s.profitFactor.toFixed(2) : '∞'} hint={`${fmtUsd(s.grossWin, 0)} gross win / ${fmtUsd(s.grossLoss, 0)} gross loss`} />
             <StatCard label="Expectancy" value={fmtUsd(s.expectancy)} tone={s.expectancy > 0 ? 'up' : 'down'} hint="avg P&L per trade" />
-            <StatCard label="Avg win / loss" value={s.avgLoss > 0 ? (s.avgWin / s.avgLoss).toFixed(2) : '—'} hint={`${fmtUsd(s.avgWin, 0)} / ${fmtUsd(s.avgLoss, 0)}`} />
-            <StatCard label="Total R" value={`${s.totalR >= 0 ? '+' : ''}${s.totalR.toFixed(1)}R`} tone={s.totalR > 0 ? 'up' : 'down'} hint={`avg ${s.avgR.toFixed(2)}R`} />
-            <StatCard label="Max drawdown" value={fmtUsd(s.maxDrawdown, 0)} tone="down" hint="on the equity curve" />
-            <StatCard label="Streak" value={`${s.currentStreak > 0 ? `${s.currentStreak}W` : s.currentStreak < 0 ? `${-s.currentStreak}L` : '—'}`} hint={`best ${s.maxWinStreak}W · worst ${s.maxLossStreak}L · avg hold ${fmtDuration(s.avgDurationSec)}`} />
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-4 gap-3">
+            <StatCard label="Avg win / loss" value={s.avgLoss > 0 ? (s.avgWin / s.avgLoss).toFixed(2) : '—'} hint={`${fmtUsd(s.avgWin, 0)} avg win / ${fmtUsd(s.avgLoss, 0)} avg loss`} />
+            <StatCard label="Total R" value={`${s.totalR >= 0 ? '+' : ''}${s.totalR.toFixed(1)}R`} tone={s.totalR > 0 ? 'up' : 'down'} hint={`avg ${s.avgR.toFixed(2)}R per trade`} />
+            <StatCard label="Max drawdown" value={fmtUsd(s.maxDrawdown, 0)} tone="down" hint="peak-to-trough on equity curve" />
+            <StatCard label="Sharpe ratio" value={isFinite(s.sharpe) ? s.sharpe.toFixed(2) : '—'} tone={s.sharpe > 1 ? 'up' : s.sharpe < 0 ? 'down' : 'none'} hint={`streak ${s.currentStreak > 0 ? `+${s.currentStreak}W` : s.currentStreak < 0 ? `${s.currentStreak}L` : '—'} · avg hold ${fmtDuration(s.avgDurationSec)}`} />
           </div>
 
           <div className="card">

@@ -22,6 +22,7 @@ export interface Summary {
   maxWinStreak: number
   maxLossStreak: number
   avgDurationSec: number
+  sharpe: number // per-trade Sharpe ratio (mean/std of P&L)
 }
 
 export function summarize(tradesIn: Trade[]): Summary {
@@ -50,6 +51,12 @@ export function summarize(tradesIn: Trade[]): Summary {
     durSum += Math.max(0, t.exitTime - t.entryTime)
   }
 
+  const meanPnl = n ? (grossWin - grossLoss) / n : 0
+  let sumSq = 0
+  for (const t of trades) sumSq += (t.pnl - meanPnl) ** 2
+  const std = n > 1 ? Math.sqrt(sumSq / (n - 1)) : 0
+  const sharpe = std > 0 ? meanPnl / std : 0
+
   return {
     n, wins, losses, breakeven,
     winRate: n ? wins / n : 0,
@@ -64,7 +71,16 @@ export function summarize(tradesIn: Trade[]): Summary {
     maxDrawdown: maxDD,
     currentStreak: streak, maxWinStreak, maxLossStreak,
     avgDurationSec: n ? durSum / n : 0,
+    sharpe,
   }
+}
+
+export function sessionLabel(entryTime: number): string {
+  const h = new Date(entryTime * 1000).getUTCHours()
+  if (h < 8) return 'Asian'
+  if (h < 16) return 'London'
+  if (h < 22) return 'New York'
+  return 'Off-hours'
 }
 
 export interface EquityPoint { i: number; time: number; equity: number }
