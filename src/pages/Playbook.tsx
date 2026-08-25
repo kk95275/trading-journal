@@ -125,10 +125,33 @@ function MiniStat({ label, value }: { label: string; value: string }) {
 function SetupModal({ setup, onClose }: { setup: Setup | null; onClose: () => void }) {
   const [name, setName] = useState(setup?.name ?? '')
   const [description, setDescription] = useState(setup?.description ?? '')
-  const [criteria, setCriteria] = useState(setup?.criteria.join('\n') ?? '')
+  const [selected, setSelected] = useState<string[]>(setup?.criteria ?? [])
+  const [newConf, setNewConf] = useState('')
+
+  const allSetups = useLiveQuery(() => db.setups.toArray(), [], [])
+
+  // All unique confirmations across every setup, with current setup's own list merged in
+  const allConfs = useMemo(() => {
+    const seen = new Set<string>()
+    for (const s of (allSetups ?? [])) {
+      for (const c of s.criteria) seen.add(c)
+    }
+    for (const c of selected) seen.add(c)
+    return [...seen]
+  }, [allSetups, selected])
+
+  const toggle = (c: string) =>
+    setSelected(prev => prev.includes(c) ? prev.filter(x => x !== c) : [...prev, c])
+
+  const addNew = () => {
+    const trimmed = newConf.trim()
+    if (!trimmed) return
+    if (!selected.includes(trimmed)) setSelected(prev => [...prev, trimmed])
+    setNewConf('')
+  }
 
   const save = async () => {
-    const rec = { name: name.trim(), description: description.trim(), criteria: criteria.split('\n').map(s => s.trim()).filter(Boolean) }
+    const rec = { name: name.trim(), description: description.trim(), criteria: selected }
     if (!rec.name) return
     if (setup?.id) await db.setups.update(setup.id, rec)
     else await db.setups.add(rec)
@@ -148,8 +171,41 @@ function SetupModal({ setup, onClose }: { setup: Setup | null; onClose: () => vo
         <div><label className="label">Name</label><input className="input" placeholder="e.g. London sweep reversal" value={name} onChange={e => setName(e.target.value)} /></div>
         <div><label className="label">Description</label><input className="input" placeholder="One-liner about when this setup applies" value={description} onChange={e => setDescription(e.target.value)} /></div>
         <div>
-          <label className="label">Confirmation checklist — one per line</label>
-          <textarea className="input min-h-[120px]" placeholder={'Liquidity swept\n15m structure break\nFVG present\nEntry during London or NY'} value={criteria} onChange={e => setCriteria(e.target.value)} />
+          <label className="label">Confirmation checklist</label>
+          {allConfs.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {allConfs.map(c => {
+                const active = selected.includes(c)
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => toggle(c)}
+                    className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
+                      active
+                        ? 'bg-[#3987e5] border-[#3987e5] text-white'
+                        : 'bg-transparent border-grid text-muted hover:border-[#3987e5] hover:text-ink'
+                    }`}
+                  >
+                    {active && <span className="mr-1">✓</span>}{c}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+          <div className="flex gap-2">
+            <input
+              className="input flex-1"
+              placeholder="Add new confirmation…"
+              value={newConf}
+              onChange={e => setNewConf(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addNew() } }}
+            />
+            <button type="button" className="btn-ghost" onClick={addNew} disabled={!newConf.trim()}>Add</button>
+          </div>
+          {selected.length > 0 && (
+            <p className="text-[11px] text-muted mt-1">{selected.length} confirmation{selected.length !== 1 ? 's' : ''} selected</p>
+          )}
         </div>
         <div className="flex justify-between">
           {setup ? <button className="btn-ghost !text-down" onClick={del}>Delete</button> : <span />}
