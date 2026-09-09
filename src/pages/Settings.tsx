@@ -8,6 +8,7 @@ import { isElectron } from '../lib/platform'
 import { checkForUpdates, getAppVersion, installUpdate, useUpdaterStatus } from '../lib/updater'
 import { Modal, PageHead } from '../components/ui'
 import InstrumentsCard from '../components/InstrumentsCard'
+import AISettingsCard from '../components/AISettingsCard'
 
 export default function Settings() {
   const accounts = useLiveQuery(() => db.accounts.toArray(), [], [])
@@ -154,6 +155,8 @@ export default function Settings() {
           </div>
           <button className="btn-primary" onClick={saveDefaults}>Save defaults</button>
         </div>
+
+        <AISettingsCard />
 
         <SyncCard />
         {isElectron && <UpdatesCard />}

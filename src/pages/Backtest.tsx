@@ -14,6 +14,7 @@ import ReplayChart, { type ChartHandle } from '../components/ReplayChart'
 import SessionsPanel from '../components/SessionsPanel'
 import IndicatorsPanel from '../components/IndicatorsPanel'
 import { PnlText } from '../components/ui'
+import AnalyzeButton from '../components/AnalyzeButton'
 
 const SPEEDS = [1, 2, 4, 8, 16]
 
@@ -582,7 +583,10 @@ function SessionTrades({ engine }: { engine: ReplayEngine }) {
   if (!trades.length) return <div className="card text-xs text-muted text-center py-4">No trades this session yet.</div>
   return (
     <div className="card !p-0 overflow-hidden">
-      <div className="px-3 py-2 text-xs font-semibold text-ink border-b border-hairline">Session trades ({trades.length})</div>
+      <div className="px-3 py-2 border-b border-hairline flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold text-ink">Session trades ({trades.length})</div>
+        <AnalyzeButton trades={trades} scope={`backtest session (${trades.length} trades)`} className="btn-ghost text-[11px] !py-0.5" label="Analyze" />
+      </div>
       <div className="max-h-64 overflow-y-auto">
         {[...trades].reverse().map((t, i) => (
           <div key={i} className="px-3 py-2 border-b border-grid text-xs flex items-center gap-2">

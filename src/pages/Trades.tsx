@@ -7,6 +7,7 @@ import { fmtPx } from '../lib/symbols'
 import { useSymbolList } from '../lib/instruments'
 import { EmotionPicker, Empty, GradeBadge, GradePicker, Modal, PageHead, PnlText, emotionLabel } from '../components/ui'
 import { useAccountFilter } from '../components/useAccountFilter'
+import AnalyzeButton from '../components/AnalyzeButton'
 
 export default function Trades() {
   const { element: accountSelect, trades, accounts } = useAccountFilter()
@@ -47,6 +48,7 @@ export default function Trades() {
         sub={`${filtered.length} of ${trades.length} trades`}
         right={
           <div className="flex gap-2">
+            <AnalyzeButton trades={filtered} scope={`${filtered.length} filtered trades`} className="btn-ghost text-xs" />
             <button className="btn-ghost" onClick={() => setImporting(true)}>Import CSV</button>
             <button className="btn-primary" onClick={() => setAdding(true)}>+ Add Trade</button>
           </div>

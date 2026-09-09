@@ -6,12 +6,25 @@ export interface SettingRow {
   value: unknown
 }
 
+export interface AIConversation {
+  id?: number
+  title: string
+  provider: string
+  model: string
+  createdAt: number
+  updatedAt: number
+  // messages stored inline; a single conversation stays small enough that
+  // splitting into a separate table isn't worth the extra query per read.
+  messages: { role: 'user' | 'assistant' | 'system'; content: string; ts: number }[]
+}
+
 class TradingJournalDB extends Dexie {
   accounts!: Table<Account, number>
   trades!: Table<Trade, number>
   setups!: Table<Setup, number>
   journal!: Table<JournalEntry, number>
   settings!: Table<SettingRow, string>
+  aiConversations!: Table<AIConversation, number>
 
   constructor() {
     super('trading-journal')
@@ -21,6 +34,9 @@ class TradingJournalDB extends Dexie {
       setups: '++id, name',
       journal: '++id, date',
       settings: 'key',
+    })
+    this.version(2).stores({
+      aiConversations: '++id, updatedAt',
     })
   }
 }

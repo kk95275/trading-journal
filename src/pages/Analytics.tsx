@@ -7,6 +7,7 @@ import { fmtDuration, fmtPct, fmtUsd } from '../lib/gold'
 import { bucketStats, sessionLabel, summarize } from '../lib/stats'
 import { Empty, GradeBadge, PageHead, StatCard, emotionLabel } from '../components/ui'
 import { useAccountFilter } from '../components/useAccountFilter'
+import AnalyzeButton from '../components/AnalyzeButton'
 
 const INK_MUTED = '#898781'
 const GRID_COLOR = '#2c2c2a'
@@ -79,7 +80,12 @@ export default function Analytics() {
       <PageHead
         title="Analytics"
         sub="Performance breakdowns by instrument, session, trade quality and psychology"
-        right={accountSelect}
+        right={
+          <div className="flex items-center gap-2">
+            {accountSelect}
+            <AnalyzeButton trades={trades} scope="analytics view" />
+          </div>
+        }
       />
 
       {!trades.length ? (

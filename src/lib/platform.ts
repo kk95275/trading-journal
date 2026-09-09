@@ -71,6 +71,12 @@ declare global {
       checkForUpdates(): Promise<void>
       installUpdate(): Promise<void>
       onUpdaterStatus(cb: (status: UpdaterStatus) => void): () => void
+      // AI (see src/lib/ai.ts for request shape). Keys never leave main.
+      aiHasKey(provider: string): Promise<boolean>
+      aiSetKey(provider: string, key: string): Promise<void>
+      aiDeleteKey(provider: string): Promise<void>
+      aiChat(req: unknown): Promise<string>
+      aiChatStream(req: unknown, onDelta: (delta: string) => void, signal?: AbortSignal): Promise<string>
     }
   }
 }

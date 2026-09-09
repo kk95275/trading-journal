@@ -3,6 +3,7 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { initSync } from './lib/sync'
 import { refreshInstruments } from './lib/instruments'
 import { isElectron } from './lib/platform'
+import AIChat from './pages/AIChat'
 import Analytics from './pages/Analytics'
 import Backtest from './pages/Backtest'
 import CalendarPage from './pages/CalendarPage'
@@ -26,6 +27,8 @@ const NAV: NavItem[] = [
   { kind: 'link', to: '/playbook',  label: 'Playbook',   icon: '📖' },
   { kind: 'section', label: 'Backtesting' },
   { kind: 'link', to: '/backtest',  label: 'Backtest',   icon: '📉' },
+  { kind: 'section', label: 'AI' },
+  { kind: 'link', to: '/ai',        label: 'AI Chat',    icon: '🤖' },
 ]
 
 export default function App() {
@@ -95,6 +98,7 @@ export default function App() {
           <Route path="/journal"    element={<Journal />} />
           <Route path="/playbook"   element={<Playbook />} />
           <Route path="/backtest"   element={<Backtest />} />
+          <Route path="/ai"         element={<AIChat />} />
           <Route path="/settings"   element={<Settings />} />
         </Routes>
       </main>

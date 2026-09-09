@@ -7,10 +7,13 @@
 // "type":"module", since Electron's main entry point must be CJS (or a real .mjs, but
 // CJS keeps require()-based Electron APIs simple). The shared *.mjs libs are pure ESM,
 // loaded here via dynamic import() — a .cjs file can't require() an ESM module.
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, safeStorage } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import fs from 'node:fs'
 import path from 'node:path'
+import https from 'node:https'
+import http from 'node:http'
+import { URL } from 'node:url'
 
 type UpdaterStatus =
   | { state: 'idle' }
@@ -28,8 +31,11 @@ type UpdaterStatus =
 const storageRoot = app.isPackaged ? app.getPath('userData') : path.resolve(__dirname, '..')
 const journalDir = path.join(storageRoot, 'data-journal')
 const instrumentsDir = app.isPackaged ? path.join(storageRoot, 'instruments') : path.join(storageRoot, 'public', 'data')
+// AI keys live in userData either way (never checked into the repo, even in dev).
+const aiKeysFile = path.join(app.getPath('userData'), 'ai-keys.json')
 
 const SYMBOL_RE = /^[A-Z0-9_.-]+$/i
+const AI_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'ollama'])
 
 // Loaded via dynamic import() (a .cjs file can't require() these ESM modules) from
 // their original location in the repo — not recompiled/copied, so there's exactly one
@@ -98,6 +104,219 @@ async function registerIpc() {
         event.sender.send(`${channel}:error`, String(e?.message ?? e))
       }
     })()
+  })
+
+  registerAiIpc()
+}
+
+// ─── AI: encrypted key storage + streaming HTTP proxy ────────────────────────
+// Keys are encrypted at rest with the OS keychain (Keychain / DPAPI / libsecret)
+// via safeStorage. The renderer only ever sees "has a key" bits — never the
+// plaintext — and all provider HTTPS calls go out from here so we bypass browser
+// CORS entirely.
+
+type StoredKeys = Record<string, string> // provider -> base64(encrypted)
+
+function readKeys(): StoredKeys {
+  try { return JSON.parse(fs.readFileSync(aiKeysFile, 'utf8')) } catch { return {} }
+}
+function writeKeys(k: StoredKeys) {
+  fs.writeFileSync(aiKeysFile, JSON.stringify(k), { mode: 0o600 })
+}
+
+function decryptKey(provider: string): string | null {
+  const store = readKeys()
+  const b64 = store[provider]
+  if (!b64) return null
+  if (!safeStorage.isEncryptionAvailable()) return null
+  try { return safeStorage.decryptString(Buffer.from(b64, 'base64')) } catch { return null }
+}
+
+function registerAiIpc() {
+  ipcMain.handle('ai:hasKey', (_e, provider: string) => {
+    if (!AI_PROVIDERS.has(provider)) return false
+    const store = readKeys()
+    return !!store[provider]
+  })
+  ipcMain.handle('ai:setKey', (_e, provider: string, key: string) => {
+    if (!AI_PROVIDERS.has(provider)) throw new Error('bad provider')
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('OS keychain not available on this system')
+    const store = readKeys()
+    if (!key) { delete store[provider] }
+    else { store[provider] = safeStorage.encryptString(key).toString('base64') }
+    writeKeys(store)
+  })
+  // Deliberately never exposed to the renderer: ai:getKey is called only from
+  // inside the main process (chat handlers below).
+  ipcMain.handle('ai:deleteKey', (_e, provider: string) => {
+    if (!AI_PROVIDERS.has(provider)) return
+    const store = readKeys()
+    delete store[provider]
+    writeKeys(store)
+  })
+
+  ipcMain.handle('ai:chat', async (_e, req: AiChatRequest) => {
+    const chunks: string[] = []
+    await runProviderStream(req, d => chunks.push(d))
+    return chunks.join('')
+  })
+
+  ipcMain.on('ai:chatStream', (event, args: { req: AiChatRequest; channel: string }) => {
+    const { req, channel } = args
+    void (async () => {
+      try {
+        const abort = new AbortController()
+        const cancelListener = () => abort.abort()
+        ipcMain.once(`${channel}:cancel`, cancelListener)
+        try {
+          await runProviderStream(req, d => event.sender.send(`${channel}:delta`, d), abort.signal)
+          event.sender.send(`${channel}:done`)
+        } finally {
+          ipcMain.removeListener(`${channel}:cancel`, cancelListener)
+        }
+      } catch (e: any) {
+        event.sender.send(`${channel}:error`, String(e?.message ?? e))
+      }
+    })()
+  })
+}
+
+// Shape mirrors src/lib/ai.ts ChatRequest. Kept in sync manually — the two
+// codepaths (renderer fallback + main-process proxy) build the same wire request.
+interface AiChatRequest {
+  provider: 'openai' | 'anthropic' | 'gemini' | 'ollama'
+  model: string
+  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
+  temperature?: number
+  maxTokens?: number
+  ollamaBaseUrl?: string
+}
+
+interface BuiltAiRequest { url: string; headers: Record<string, string>; body: string }
+
+function buildAiRequest(req: AiChatRequest, key: string): BuiltAiRequest {
+  const { provider, model, messages, temperature, maxTokens } = req
+  if (provider === 'openai') {
+    return {
+      url: 'https://api.openai.com/v1/chat/completions',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, stream: true }),
+    }
+  }
+  if (provider === 'anthropic') {
+    const system = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n')
+    const rest = messages.filter(m => m.role !== 'system')
+    return {
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        system: system || undefined,
+        messages: rest.map(m => ({ role: m.role, content: m.content })),
+        max_tokens: maxTokens ?? 4096,
+        temperature,
+        stream: true,
+      }),
+    }
+  }
+  if (provider === 'gemini') {
+    const system = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n')
+    const contents = messages
+      .filter(m => m.role !== 'system')
+      .map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
+    return {
+      url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        contents,
+        systemInstruction: system ? { parts: [{ text: system }] } : undefined,
+        generationConfig: { temperature, maxOutputTokens: maxTokens },
+      }),
+    }
+  }
+  const base = (req.ollamaBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '')
+  return {
+    url: `${base}/api/chat`,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model, messages, stream: true, options: { temperature, num_predict: maxTokens } }),
+  }
+}
+
+function parseAiLine(provider: AiChatRequest['provider'], raw: string): string | null {
+  const line = raw.trim()
+  if (!line) return null
+  if (provider === 'ollama') {
+    try { const j = JSON.parse(line); return j.message?.content ?? null } catch { return null }
+  }
+  if (!line.startsWith('data:')) return null
+  const payload = line.slice(5).trim()
+  if (!payload || payload === '[DONE]') return null
+  try {
+    const j = JSON.parse(payload)
+    if (provider === 'openai') return j.choices?.[0]?.delta?.content ?? null
+    if (provider === 'anthropic') return j.type === 'content_block_delta' ? (j.delta?.text ?? null) : null
+    if (provider === 'gemini') {
+      const parts = j.candidates?.[0]?.content?.parts
+      if (Array.isArray(parts)) return parts.map((p: any) => p.text ?? '').join('')
+      return null
+    }
+  } catch { /* partial */ }
+  return null
+}
+
+async function runProviderStream(req: AiChatRequest, onDelta: (d: string) => void, signal?: AbortSignal): Promise<void> {
+  const key = req.provider === 'ollama' ? '' : (decryptKey(req.provider) ?? '')
+  if (req.provider !== 'ollama' && !key) throw new Error(`No ${req.provider} key set`)
+  const built = buildAiRequest(req, key)
+  const u = new URL(built.url)
+  const isHttps = u.protocol === 'https:'
+  const lib = isHttps ? https : http
+
+  await new Promise<void>((resolve, reject) => {
+    const request = lib.request({
+      method: 'POST',
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      headers: { ...built.headers, 'content-length': Buffer.byteLength(built.body).toString() },
+    }, res => {
+      const status = res.statusCode ?? 0
+      if (status < 200 || status >= 300) {
+        const chunks: Buffer[] = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => reject(new Error(`${req.provider} ${status}: ${Buffer.concat(chunks).toString('utf8').slice(0, 400)}`)))
+        return
+      }
+      let buf = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk: string) => {
+        buf += chunk
+        let idx: number
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx)
+          buf = buf.slice(idx + 1)
+          const delta = parseAiLine(req.provider, line)
+          if (delta) onDelta(delta)
+        }
+      })
+      res.on('end', () => {
+        const tail = parseAiLine(req.provider, buf)
+        if (tail) onDelta(tail)
+        resolve()
+      })
+      res.on('error', reject)
+    })
+    request.on('error', reject)
+    if (signal) {
+      if (signal.aborted) { request.destroy(new Error('aborted')); return }
+      signal.addEventListener('abort', () => request.destroy(new Error('aborted')), { once: true })
+    }
+    request.write(built.body)
+    request.end()
   })
 }
 

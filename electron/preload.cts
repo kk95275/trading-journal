@@ -40,4 +40,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('updater:status', listener)
     return () => ipcRenderer.removeListener('updater:status', listener)
   },
+
+  // AI. Keys never leave the main process — the renderer only sees hasKey/set/delete.
+  aiHasKey: (provider: string) => ipcRenderer.invoke('ai:hasKey', provider),
+  aiSetKey: (provider: string, key: string) => ipcRenderer.invoke('ai:setKey', provider, key),
+  aiDeleteKey: (provider: string) => ipcRenderer.invoke('ai:deleteKey', provider),
+  aiChat: (req: unknown) => ipcRenderer.invoke('ai:chat', req),
+  aiChatStream: (req: unknown, onDelta: (d: string) => void, signal?: AbortSignal) =>
+    new Promise<string>((resolve, reject) => {
+      const channel = `ai:chatStream:${Date.now()}:${Math.random().toString(36).slice(2)}`
+      let full = ''
+      const cleanup = () => {
+        ipcRenderer.removeAllListeners(`${channel}:delta`)
+        ipcRenderer.removeAllListeners(`${channel}:done`)
+        ipcRenderer.removeAllListeners(`${channel}:error`)
+      }
+      ipcRenderer.on(`${channel}:delta`, (_e, d: string) => { full += d; onDelta(d) })
+      ipcRenderer.on(`${channel}:done`, () => { cleanup(); resolve(full) })
+      ipcRenderer.on(`${channel}:error`, (_e, err: string) => { cleanup(); reject(new Error(err)) })
+      if (signal) {
+        signal.addEventListener('abort', () => { ipcRenderer.send(`${channel}:cancel`) }, { once: true })
+      }
+      ipcRenderer.send('ai:chatStream', { req, channel })
+    }),
 })
