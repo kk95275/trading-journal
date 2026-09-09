@@ -191,7 +191,7 @@ export default function AIChat() {
                 setProvider(p)
                 setModel(p === 'ollama' ? cfg.ollamaModel : (modelsFor(p, cfg)[0]?.id ?? ''))
               }}>
-              {(['openai', 'anthropic', 'gemini', 'ollama'] as AIProvider[]).map(p => (
+              {(['openai', 'anthropic', 'gemini', 'openrouter', 'ollama'] as AIProvider[]).map(p => (
                 <option key={p} value={p}>{PROVIDER_LABELS[p]}</option>
               ))}
             </select>

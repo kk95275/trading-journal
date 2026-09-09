@@ -9,7 +9,7 @@
 
 import { isElectron } from './platform'
 
-export type AIProvider = 'openai' | 'anthropic' | 'gemini' | 'ollama'
+export type AIProvider = 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'ollama'
 
 export interface AIModel {
   id: string        // provider-native model id sent on the wire
@@ -37,6 +37,21 @@ export const MODELS: Record<AIProvider, AIModel[]> = {
     { id: 'gemini-1.5-pro',        label: 'Gemini 1.5 Pro',   contextK: 2000 },
     { id: 'gemini-1.5-flash',      label: 'Gemini 1.5 Flash', contextK: 1000 },
   ],
+  openrouter: [
+    // Curated top picks. OpenRouter has 300+ models — set a custom one via
+    // the free-text input in the model picker if what you want isn't here.
+    { id: 'anthropic/claude-opus-4.5',           label: 'Claude Opus 4.5',        contextK: 200 },
+    { id: 'anthropic/claude-sonnet-4.5',         label: 'Claude Sonnet 4.5',      contextK: 200 },
+    { id: 'anthropic/claude-haiku-4.5',          label: 'Claude Haiku 4.5',       contextK: 200 },
+    { id: 'openai/gpt-5',                        label: 'GPT-5',                  contextK: 400 },
+    { id: 'openai/gpt-5-mini',                   label: 'GPT-5 mini',             contextK: 400 },
+    { id: 'openai/gpt-4o',                       label: 'GPT-4o',                 contextK: 128 },
+    { id: 'google/gemini-2.5-pro',               label: 'Gemini 2.5 Pro',         contextK: 1000 },
+    { id: 'google/gemini-2.5-flash',             label: 'Gemini 2.5 Flash',       contextK: 1000 },
+    { id: 'deepseek/deepseek-r1',                label: 'DeepSeek R1 (reasoning)', contextK: 128 },
+    { id: 'meta-llama/llama-3.3-70b-instruct',   label: 'Llama 3.3 70B',          contextK: 128 },
+    { id: 'qwen/qwen-2.5-72b-instruct',          label: 'Qwen 2.5 72B',           contextK: 128 },
+  ],
   ollama: [
     // Ollama models are installed locally — this list is a starting hint.
     // The Settings UI also allows typing any model name.
@@ -52,6 +67,7 @@ export const PROVIDER_LABELS: Record<AIProvider, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic (Claude)',
   gemini: 'Google Gemini',
+  openrouter: 'OpenRouter (one key, all models)',
   ollama: 'Ollama (local)',
 }
 
@@ -143,6 +159,20 @@ export function buildRequest(req: ChatRequest, key: string): BuiltRequest {
     return {
       url: 'https://api.openai.com/v1/chat/completions',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, stream: true }),
+    }
+  }
+  if (provider === 'openrouter') {
+    return {
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${key}`,
+        // Optional OpenRouter attribution — makes the app show up in their
+        // leaderboard/dashboard. Harmless to include.
+        'http-referer': 'https://github.com/kk95275/trading-journal',
+        'x-title': 'Trading Journal',
+      },
       body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, stream: true }),
     }
   }
@@ -245,7 +275,7 @@ function parseStreamLine(provider: AIProvider, raw: string): string | null {
 
   try {
     const j = JSON.parse(payload)
-    if (provider === 'openai') return j.choices?.[0]?.delta?.content ?? null
+    if (provider === 'openai' || provider === 'openrouter') return j.choices?.[0]?.delta?.content ?? null
     if (provider === 'anthropic') {
       // content_block_delta events carry text under delta.text
       if (j.type === 'content_block_delta') return j.delta?.text ?? null

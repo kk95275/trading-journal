@@ -20,7 +20,7 @@ export const DEFAULT_AI_CONFIG: AIConfig = {
   customModels: {},
 }
 
-const PROVIDERS: AIProvider[] = ['openai', 'anthropic', 'gemini', 'ollama']
+const PROVIDERS: AIProvider[] = ['openai', 'anthropic', 'gemini', 'openrouter', 'ollama']
 
 export async function loadAIConfig(): Promise<AIConfig> {
   const raw = await getSetting<Partial<AIConfig>>('aiConfig', {})
@@ -115,7 +115,10 @@ export default function AISettingsCard() {
       <div>
         <h3 className="text-sm font-semibold text-ink">AI models</h3>
         <p className="text-xs text-muted mt-1">
-          Bring your own API key for OpenAI, Anthropic, or Gemini — or run local models via Ollama.{' '}
+          Bring your own API key for OpenAI, Anthropic, Gemini, or OpenRouter — or run local models via Ollama.
+          {' '}
+          <span className="text-ink2">Tip: OpenRouter gives you one key for all major models (Claude, GPT, Gemini, Llama, DeepSeek, etc.) with a single bill.</span>
+          {' '}
           {isElectron
             ? <span className="text-ink2">Keys are encrypted with your OS keychain (never stored in plaintext).</span>
             : <span className="text-warn">Browser dev mode: keys are session-only (cleared on refresh). Use the desktop app for persistent encrypted storage.</span>}

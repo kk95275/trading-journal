@@ -35,7 +35,7 @@ const instrumentsDir = app.isPackaged ? path.join(storageRoot, 'instruments') : 
 const aiKeysFile = path.join(app.getPath('userData'), 'ai-keys.json')
 
 const SYMBOL_RE = /^[A-Z0-9_.-]+$/i
-const AI_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'ollama'])
+const AI_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'openrouter', 'ollama'])
 
 // Loaded via dynamic import() (a .cjs file can't require() these ESM modules) from
 // their original location in the repo — not recompiled/copied, so there's exactly one
@@ -184,7 +184,7 @@ function registerAiIpc() {
 // Shape mirrors src/lib/ai.ts ChatRequest. Kept in sync manually — the two
 // codepaths (renderer fallback + main-process proxy) build the same wire request.
 interface AiChatRequest {
-  provider: 'openai' | 'anthropic' | 'gemini' | 'ollama'
+  provider: 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'ollama'
   model: string
   messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
   temperature?: number
@@ -200,6 +200,18 @@ function buildAiRequest(req: AiChatRequest, key: string): BuiltAiRequest {
     return {
       url: 'https://api.openai.com/v1/chat/completions',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, stream: true }),
+    }
+  }
+  if (provider === 'openrouter') {
+    return {
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${key}`,
+        'http-referer': 'https://github.com/kk95275/trading-journal',
+        'x-title': 'Trading Journal',
+      },
       body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, stream: true }),
     }
   }
@@ -257,7 +269,7 @@ function parseAiLine(provider: AiChatRequest['provider'], raw: string): string |
   if (!payload || payload === '[DONE]') return null
   try {
     const j = JSON.parse(payload)
-    if (provider === 'openai') return j.choices?.[0]?.delta?.content ?? null
+    if (provider === 'openai' || provider === 'openrouter') return j.choices?.[0]?.delta?.content ?? null
     if (provider === 'anthropic') return j.type === 'content_block_delta' ? (j.delta?.text ?? null) : null
     if (provider === 'gemini') {
       const parts = j.candidates?.[0]?.content?.parts
