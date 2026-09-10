@@ -86,6 +86,7 @@ function AddInstrument({ onClose, onDone }: { onClose: () => void; onDone: () =>
   const [decimals, setDecimals] = useState(5)
   const [inputStep, setInputStep] = useState(0.0001)
   const [defaultSpread, setDefaultSpread] = useState(0.0001)
+  const [quoteToUsd, setQuoteToUsd] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [filePath, setFilePath] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -98,6 +99,7 @@ function AddInstrument({ onClose, onDone }: { onClose: () => void; onDone: () =>
     setDecimals(spec.decimals)
     setInputStep(spec.inputStep)
     setDefaultSpread(spec.defaultSpread)
+    setQuoteToUsd(spec.quoteToUsd ?? 1)
   }
 
   const pickFile = async () => {
@@ -114,7 +116,12 @@ function AddInstrument({ onClose, onDone }: { onClose: () => void; onDone: () =>
     setBusy(true)
     setProgress(null)
     try {
-      const spec: SymbolSpec = { symbol: sym, name: name.trim() || sym, contractSize, decimals, inputStep, defaultSpread }
+      const spec: SymbolSpec = {
+        symbol: sym,
+        name: name.trim() || sym,
+        contractSize, decimals, inputStep, defaultSpread,
+        ...(quoteToUsd !== 1 ? { quoteToUsd } : {}),
+      }
       await platform.importInstrument(
         { symbol: sym, spec, file: file ?? undefined, filePath: filePath ?? undefined },
         (rows, monthKey) => setProgress({ rows, monthKey }),
@@ -146,16 +153,27 @@ function AddInstrument({ onClose, onDone }: { onClose: () => void; onDone: () =>
             <input className="input" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. NZ Dollar / USD" />
           </div>
         </div>
-        <div className="flex gap-2">
-          <button type="button" className="btn-ghost text-xs" onClick={() => quickFill(SYMBOLS.XAUUSD)}>Fill metal-like (XAUUSD) defaults</button>
-          <button type="button" className="btn-ghost text-xs" onClick={() => quickFill(SYMBOLS.EURUSD)}>Fill FX-like (EURUSD) defaults</button>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" className="btn-ghost text-xs" onClick={() => quickFill(SYMBOLS.XAUUSD)}>Fill metal-like (XAUUSD)</button>
+          <button type="button" className="btn-ghost text-xs" onClick={() => quickFill(SYMBOLS.EURUSD)}>Fill USD-quoted FX (EURUSD)</button>
+          <button type="button" className="btn-ghost text-xs" onClick={() => quickFill(SYMBOLS.GBPJPY)}>Fill JPY-quoted FX (GBPJPY)</button>
+          <button type="button" className="btn-ghost text-xs" onClick={() => quickFill(SYMBOLS.USDCHF)}>Fill USD-based (USDCHF)</button>
         </div>
-        <div className="grid grid-cols-4 gap-3">
+        <div className="grid grid-cols-3 md:grid-cols-5 gap-3">
           <div><label className="label">Contract size</label><input type="number" className="input" value={contractSize} onChange={e => setContractSize(+e.target.value)} /></div>
           <div><label className="label">Decimals</label><input type="number" className="input" value={decimals} onChange={e => setDecimals(+e.target.value)} /></div>
           <div><label className="label">Input step</label><input type="number" step="any" className="input" value={inputStep} onChange={e => setInputStep(+e.target.value)} /></div>
           <div><label className="label">Default spread</label><input type="number" step="any" className="input" value={defaultSpread} onChange={e => setDefaultSpread(+e.target.value)} /></div>
+          <div>
+            <label className="label" title="Multiplier converting quote-currency P&L → USD. USD-quoted pairs use 1. For JPY pairs use ~1/USDJPY (≈0.00667 at USDJPY=150).">
+              Quote→USD
+            </label>
+            <input type="number" step="any" className="input" value={quoteToUsd} onChange={e => setQuoteToUsd(+e.target.value)} />
+          </div>
         </div>
+        <p className="text-[11px] text-muted">
+          <span className="text-ink2">Quote→USD</span>: leave <span className="text-ink2">1</span> for USD-quoted pairs (EURUSD, XAUUSD). For JPY pairs use ≈<span className="text-ink2">0.00667</span> (1/USDJPY at 150). For USDCHF ≈<span className="text-ink2">1.11</span>, USDCAD ≈<span className="text-ink2">0.74</span>. Approximate is fine — update it as spot rates drift.
+        </p>
         <div>
           <label className="label">Raw data file (.txt)</label>
           {isElectron ? (
