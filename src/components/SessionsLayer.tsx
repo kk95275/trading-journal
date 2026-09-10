@@ -3,14 +3,14 @@
 import { useCallback, useEffect, useRef } from 'react'
 import type { IChartApi, ISeriesApi, Logical } from 'lightweight-charts'
 import type { Bar } from '../lib/types'
-import type { ReplayEngine } from '../replay/engine'
+import type { IReplayView } from '../replay/engine'
 import { inSession, type SessionDef, type SessionsConfig } from '../replay/sessions'
 
 interface Props {
   container: HTMLElement
   chart: IChartApi
   series: ISeriesApi<'Candlestick'>
-  engine: ReplayEngine
+  engine: IReplayView
   getBars: () => Bar[]
   dataVersion: number
   config: SessionsConfig

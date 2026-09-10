@@ -5,7 +5,7 @@
 import { useEffect, useRef } from 'react'
 import { createChart, CrosshairMode, LineStyle, type IChartApi, type ISeriesApi, type UTCTimestamp } from 'lightweight-charts'
 import type { Bar } from '../lib/types'
-import type { ReplayEngine } from '../replay/engine'
+import type { IReplayView } from '../replay/engine'
 import {
   macdFull, macdLast, rsiFull, rsiLast, HIST_UP, HIST_DOWN,
   type ActiveIndicator, type MacdResult, type RsiResult,
@@ -14,7 +14,7 @@ import { indicatorLabel } from '../replay/indicators'
 
 interface Props {
   mainChart: IChartApi
-  engine: ReplayEngine
+  engine: IReplayView
   getBars: () => Bar[]
   dataVersion: number
   ind: ActiveIndicator

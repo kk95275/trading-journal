@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { IChartApi, ISeriesApi, Logical } from 'lightweight-charts'
 import type { Bar } from '../lib/types'
-import type { ReplayEngine } from '../replay/engine'
+import type { IReplayView } from '../replay/engine'
 import {
   DRAW_COLORS, distToSegment, nearestIndex, nextDrawingId,
   type Anchor, type Drawing, type TextH, type TextV, type Tool,
@@ -15,7 +15,7 @@ interface Props {
   container: HTMLElement
   chart: IChartApi
   series: ISeriesApi<'Candlestick'>
-  engine: ReplayEngine
+  engine: IReplayView
   getBars: () => Bar[]
   dataVersion: number
   onCanvas: (c: HTMLCanvasElement | null) => void

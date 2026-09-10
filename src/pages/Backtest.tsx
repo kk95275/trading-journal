@@ -10,11 +10,14 @@ import { getManifest } from '../data/dataService'
 import { ReplayEngine, getActiveEngine, setActiveEngine, type OpenPosition, type SessionConfig } from '../replay/engine'
 import { defaultSessionsConfig, type SessionsConfig } from '../replay/sessions'
 import { defaultIndicatorsConfig, migrateIndicatorsConfig, type IndicatorsConfig } from '../replay/indicators'
+import { openSyncChannel, snapshotOf, REPLAY_SYNC_LOCALSTORAGE, type SyncMessage } from '../replay/syncChannel'
 import ReplayChart, { type ChartHandle } from '../components/ReplayChart'
 import SessionsPanel from '../components/SessionsPanel'
 import IndicatorsPanel from '../components/IndicatorsPanel'
 import { PnlText } from '../components/ui'
 import AnalyzeButton from '../components/AnalyzeButton'
+
+const MAX_PANES = 3
 
 const SPEEDS = [1, 2, 4, 8, 16]
 
@@ -224,7 +227,11 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
 /* ---------------- live session ---------------- */
 
 function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void }) {
-  const [tfSec, setTfSec] = useState(900)
+  // Panes: one timeframe per chart. First pane's TF is used for play/step advance
+  // (that's the "primary" replay pace). Extra panes just re-render on every engine
+  // notify with their own aggregation.
+  const [paneTfs, setPaneTfs] = useState<number[]>([900])
+  const tfSec = paneTfs[0] ?? 900
   const [customTfs, setCustomTfs] = useState<TfDef[]>([])
   const [tfInput, setTfInput] = useState('')
   const [showTfAdd, setShowTfAdd] = useState(false)
@@ -240,7 +247,52 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
     void getSetting<SessionsConfig | null>('sessionsConfig', null).then(c => c && setSessionsCfg(c))
     void getSetting<TfDef[]>('customTfs', []).then(setCustomTfs)
     void getSetting<unknown>('indicatorsConfig', null).then(c => c && setIndCfg(migrateIndicatorsConfig(c)))
+    void getSetting<number[]>('paneTfs', [900]).then(v => setPaneTfs(v.slice(0, MAX_PANES)))
   }, [])
+
+  // Persist pane count/timeframes so they survive route changes.
+  useEffect(() => { void setSetting('paneTfs', paneTfs) }, [paneTfs])
+
+  // Broadcast engine state to any pop-out replay windows via BroadcastChannel.
+  // Also stash the config in localStorage so a window opened later can bootstrap
+  // its MirrorEngine without waiting for the next tick.
+  useEffect(() => {
+    try {
+      localStorage.setItem(REPLAY_SYNC_LOCALSTORAGE, JSON.stringify(engine.config))
+    } catch {/* private mode etc. */}
+    const channel = openSyncChannel()
+    const publish = () => {
+      const msg: SyncMessage = { kind: 'tick', snapshot: snapshotOf(engine) }
+      channel.postMessage(msg)
+    }
+    const onMessage = (e: MessageEvent<SyncMessage>) => {
+      // A newly opened pop-out asks the primary for a config+snapshot hello.
+      if (e.data?.kind === 'request-hello') {
+        const hello: SyncMessage = { kind: 'hello', config: engine.config, snapshot: snapshotOf(engine) }
+        channel.postMessage(hello)
+      }
+    }
+    channel.addEventListener('message', onMessage)
+    const unsub = engine.subscribe(publish)
+    // Initial broadcast so any already-open pop-out catches up immediately.
+    publish()
+    return () => {
+      channel.removeEventListener('message', onMessage)
+      channel.postMessage({ kind: 'session-ended' } as SyncMessage)
+      channel.close()
+      unsub()
+    }
+  }, [engine])
+
+  const openPopoutWindow = () => {
+    // HashRouter, so a path fragment survives file:// in Electron and http:// in dev.
+    // Electron's default windowOpenHandler creates a real BrowserWindow — see main.cts.
+    window.open('#/replay-window', 'replay-window', 'width=1600,height=900')
+  }
+
+  const addPane = () => setPaneTfs(t => t.length >= MAX_PANES ? t : [...t, t[t.length - 1] ?? 900])
+  const removePane = (i: number) => setPaneTfs(t => t.length <= 1 ? t : t.filter((_, k) => k !== i))
+  const setPaneTf = (i: number, sec: number) => setPaneTfs(t => t.map((v, k) => k === i ? sec : v))
 
   const updateIndCfg = useCallback((c: IndicatorsConfig) => {
     setIndCfg(c)
@@ -254,18 +306,19 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
     if (!def) return
     setTfInput('')
     setShowTfAdd(false)
-    if (allTfs.some(t => t.sec === def.sec)) { setTfSec(def.sec); return }
+    if (allTfs.some(t => t.sec === def.sec)) { setPaneTfs(t => t.map((v, i) => i === 0 ? def.sec : v)); return }
     const next = [...customTfs, def].sort((a, b) => a.sec - b.sec)
     setCustomTfs(next)
     void setSetting('customTfs', next)
-    setTfSec(def.sec)
+    setPaneTfs(t => t.map((v, i) => i === 0 ? def.sec : v))
   }
 
   const removeCustomTf = (sec: number) => {
     const next = customTfs.filter(t => t.sec !== sec)
     setCustomTfs(next)
     void setSetting('customTfs', next)
-    if (tfSec === sec) setTfSec(900)
+    // If any pane was using this custom TF, switch it back to 15m.
+    setPaneTfs(t => t.map(v => v === sec ? 900 : v))
   }
 
   const updateSessionsCfg = useCallback((c: SessionsConfig) => {
@@ -325,47 +378,18 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
         {engine.loadingMore && <div className="text-xs text-warn">loading data…</div>}
         {engine.ended && <div className="text-xs text-warn">end of data</div>}
         <div className="flex-1" />
+        <button
+          className="btn-ghost text-xs"
+          title="Open extra charts in a new window — drag it to a second monitor"
+          onClick={openPopoutWindow}
+        >
+          ⧉ Pop out charts
+        </button>
         <button className="btn-ghost text-xs" onClick={() => { setPlaying(false); onEnd() }}>End session</button>
       </div>
 
-      {/* controls */}
+      {/* shared controls: play/speed/indicators/sessions/pane count */}
       <div className="relative flex items-center gap-2 px-4 py-2 border-b border-hairline bg-surface/60">
-        <div className="flex gap-1 items-center flex-wrap">
-          {allTfs.map(t => {
-            const custom = !DEFAULT_TFS.some(d => d.sec === t.sec)
-            return (
-              <button key={t.sec} className={`tab ${t.sec === tfSec ? 'tab-on' : 'tab-off'} inline-flex items-center gap-1`} onClick={() => setTfSec(t.sec)}>
-                {t.label}
-                {custom && (
-                  <span
-                    className="opacity-50 hover:opacity-100 hover:text-down"
-                    title="Remove timeframe"
-                    onClick={e => { e.stopPropagation(); removeCustomTf(t.sec) }}
-                  >
-                    ×
-                  </span>
-                )}
-              </button>
-            )
-          })}
-          <div className="relative">
-            <button className="tab tab-off" title="Add custom timeframe" onClick={() => setShowTfAdd(v => !v)}>+</button>
-            {showTfAdd && (
-              <div className="absolute left-0 top-full mt-1 z-30 card !p-2 flex items-center gap-1.5 shadow-xl">
-                <input
-                  autoFocus
-                  className="input !w-20 !py-1 text-xs"
-                  placeholder="e.g. 30m"
-                  value={tfInput}
-                  onChange={e => setTfInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') addCustomTf(); else if (e.key === 'Escape') setShowTfAdd(false) }}
-                />
-                <button className="btn-primary text-xs !px-2 !py-1" onClick={addCustomTf} disabled={!parseTfLabel(tfInput)}>Add</button>
-              </div>
-            )}
-          </div>
-        </div>
-        <div className="w-px h-5 bg-hairline mx-1" />
         <button className="btn-ghost text-xs px-2.5" title="Step one bar (→)" onClick={() => engine.step(tfSec)}>⏭ Step</button>
         <button className={`${playing ? 'btn-primary' : 'btn-ghost'} text-xs px-2.5`} title="Play/pause (space)" onClick={() => setPlaying(p => !p)}>
           {playing ? '⏸ Pause' : '▶ Play'}
@@ -387,6 +411,22 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
         >
           ƒ Indicators {showInd ? '▴' : '▾'}
         </button>
+        <div className="w-px h-5 bg-hairline mx-1" />
+        <span className="text-[11px] text-muted">Charts:</span>
+        {[1, 2, 3].map(n => (
+          <button
+            key={n}
+            className={`tab ${paneTfs.length === n ? 'tab-on' : 'tab-off'}`}
+            title={`${n} chart${n > 1 ? 's' : ''}`}
+            onClick={() => setPaneTfs(t => {
+              if (n === t.length) return t
+              if (n > t.length) return [...t, ...Array(n - t.length).fill(t[t.length - 1] ?? 900)]
+              return t.slice(0, n)
+            })}
+          >
+            {n}
+          </button>
+        ))}
         <div className="text-[11px] text-muted ml-2">space = play · → = step · ↑↓ = speed</div>
         {showInd && (
           <IndicatorsPanel
@@ -401,12 +441,69 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
         {showSessions && <SessionsPanel config={sessionsCfg} onChange={updateSessionsCfg} onClose={() => setShowSessions(false)} />}
       </div>
 
-      {/* chart + side panel */}
+      {/* chart panes + side panel */}
       <div className="flex flex-1 min-h-0">
-        <div className="flex-1 min-w-0 p-2">
-          <div className="w-full h-full rounded-lg overflow-hidden border border-white/10">
-            <ReplayChart ref={chartRef} engine={engine} tfSec={tfSec} sessions={sessionsCfg} indicators={indCfg} onStopsDragged={onStopsDragged} />
-          </div>
+        <div className={`flex-1 min-w-0 p-2 grid gap-2 ${paneTfs.length === 1 ? 'grid-cols-1' : paneTfs.length === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+          {paneTfs.map((paneTf, i) => (
+            <div key={i} className="flex flex-col rounded-lg overflow-hidden border border-white/10 min-w-0 min-h-0">
+              <div className="flex items-center gap-1 px-2 py-1 border-b border-hairline bg-surface/60 flex-wrap">
+                {allTfs.map(t => {
+                  const custom = !DEFAULT_TFS.some(d => d.sec === t.sec)
+                  return (
+                    <button
+                      key={t.sec}
+                      className={`tab ${t.sec === paneTf ? 'tab-on' : 'tab-off'} inline-flex items-center gap-1 !text-[11px] !py-0.5`}
+                      onClick={() => setPaneTf(i, t.sec)}
+                    >
+                      {t.label}
+                      {custom && i === 0 && (
+                        <span
+                          className="opacity-50 hover:opacity-100 hover:text-down"
+                          title="Remove timeframe"
+                          onClick={e => { e.stopPropagation(); removeCustomTf(t.sec) }}
+                        >×</span>
+                      )}
+                    </button>
+                  )
+                })}
+                {i === 0 && (
+                  <div className="relative">
+                    <button className="tab tab-off !text-[11px] !py-0.5" title="Add custom timeframe" onClick={() => setShowTfAdd(v => !v)}>+</button>
+                    {showTfAdd && (
+                      <div className="absolute left-0 top-full mt-1 z-30 card !p-2 flex items-center gap-1.5 shadow-xl">
+                        <input
+                          autoFocus
+                          className="input !w-20 !py-1 text-xs"
+                          placeholder="e.g. 30m"
+                          value={tfInput}
+                          onChange={e => setTfInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') addCustomTf(); else if (e.key === 'Escape') setShowTfAdd(false) }}
+                        />
+                        <button className="btn-primary text-xs !px-2 !py-1" onClick={addCustomTf} disabled={!parseTfLabel(tfInput)}>Add</button>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="flex-1" />
+                {paneTfs.length < MAX_PANES && i === paneTfs.length - 1 && (
+                  <button className="tab tab-off !text-[11px] !py-0.5" title="Add chart" onClick={addPane}>+ chart</button>
+                )}
+                {paneTfs.length > 1 && (
+                  <button className="tab tab-off !text-[11px] !py-0.5 hover:!text-down" title="Remove this chart" onClick={() => removePane(i)}>×</button>
+                )}
+              </div>
+              <div className="flex-1 min-h-0">
+                <ReplayChart
+                  ref={i === 0 ? chartRef : undefined}
+                  engine={engine}
+                  tfSec={paneTf}
+                  sessions={sessionsCfg}
+                  indicators={indCfg}
+                  onStopsDragged={onStopsDragged}
+                />
+              </div>
+            </div>
+          ))}
         </div>
         <div className="w-80 shrink-0 border-l border-hairline overflow-y-auto p-3 space-y-3">
           {engine.positions.map(p => <PositionPanel key={p.id} engine={engine} pos={p} />)}

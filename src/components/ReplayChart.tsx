@@ -7,7 +7,7 @@ import {
 import type { Bar } from '../lib/types'
 import { specFor } from '../lib/symbols'
 import * as data from '../data/dataService'
-import type { ReplayEngine } from '../replay/engine'
+import type { IReplayView } from '../replay/engine'
 import type { SessionsConfig } from '../replay/sessions'
 import { isOscillator, OverlayManager, type IndicatorsConfig } from '../replay/indicators'
 import DrawingLayer from './DrawingLayer'
@@ -19,7 +19,7 @@ export interface ChartHandle {
 }
 
 interface Props {
-  engine: ReplayEngine
+  engine: IReplayView
   tfSec: number
   sessions?: SessionsConfig
   indicators?: IndicatorsConfig

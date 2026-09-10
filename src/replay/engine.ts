@@ -247,3 +247,18 @@ export class ReplayEngine {
 let active: ReplayEngine | null = null
 export function getActiveEngine() { return active }
 export function setActiveEngine(e: ReplayEngine | null) { active = e }
+
+/**
+ * Read-only view of a replay, satisfied by both ReplayEngine (drives the sim)
+ * and MirrorEngine (renders a follower window). Shared components — ReplayChart,
+ * DrawingLayer, SessionsLayer, OscPane — accept either through this shape.
+ */
+export interface IReplayView {
+  config: SessionConfig
+  oneMin: Bar[]
+  idx: number
+  positions: OpenPosition[]
+  sessionTrades: Trade[]
+  drawings: Drawing[]
+  subscribe(fn: () => void): () => void
+}

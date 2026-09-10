@@ -375,6 +375,33 @@ function createWindow() {
   })
   if (app.isPackaged) void win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   else void win.loadURL('http://localhost:5173')
+
+  // Let window.open() from the renderer create a real BrowserWindow (e.g. the
+  // pop-out charts window on a second monitor). Reuses the same preload +
+  // isolation settings so localStorage / IndexedDB / BroadcastChannel are all
+  // shared with the primary window (same origin, same partition).
+  win.webContents.setWindowOpenHandler(({ url, features }) => {
+    // Parse "width=..,height=.." if the caller supplied them.
+    const feat: Record<string, string> = {}
+    for (const kv of (features || '').split(',')) {
+      const [k, v] = kv.split('=').map(s => s.trim())
+      if (k && v) feat[k] = v
+    }
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        width: +feat.width || 1600,
+        height: +feat.height || 900,
+        webPreferences: {
+          preload: path.join(__dirname, 'preload.cjs'),
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+        },
+      },
+    }
+  })
+
   registerUpdater(win)
 }
 

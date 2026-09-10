@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
+import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { initSync } from './lib/sync'
 import { refreshInstruments } from './lib/instruments'
 import { isElectron } from './lib/platform'
@@ -10,6 +10,7 @@ import CalendarPage from './pages/CalendarPage'
 import Dashboard from './pages/Dashboard'
 import Journal from './pages/Journal'
 import Playbook from './pages/Playbook'
+import ReplayWindow from './pages/ReplayWindow'
 import Settings from './pages/Settings'
 import Trades from './pages/Trades'
 
@@ -33,6 +34,13 @@ const NAV: NavItem[] = [
 
 export default function App() {
   useEffect(() => { void initSync(); void refreshInstruments() }, [])
+
+  // Pop-out replay window opens at #/replay-window. It's a chart-only page —
+  // no sidebar, no header. Detect the route here so we can render it bare.
+  const location = useLocation()
+  if (location.pathname === '/replay-window') {
+    return <ReplayWindow />
+  }
 
   return (
     <div className="flex h-full">
