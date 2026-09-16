@@ -13,6 +13,7 @@ import { defaultSessionsConfig, type SessionsConfig } from '../replay/sessions'
 import { defaultIndicatorsConfig, migrateIndicatorsConfig, type IndicatorsConfig } from '../replay/indicators'
 import { openSyncChannel, REPLAY_SYNC_LOCALSTORAGE, type SyncMessage } from '../replay/syncChannel'
 import ReplayChart from '../components/ReplayChart'
+import IndicatorsPanel from '../components/IndicatorsPanel'
 import { PnlText } from '../components/ui'
 
 interface TfDef { label: string; sec: number }
@@ -22,23 +23,46 @@ const DEFAULT_TFS: TfDef[] = [
 ]
 const MAX_PANES = 3
 
+interface PaneConfig {
+  tfSec: number
+  indCfg: IndicatorsConfig
+}
+
 export default function ReplayWindow() {
   const [mirror, setMirror] = useState<MirrorEngine | null>(null)
   const [ended, setEnded] = useState(false)
   const [error, setError] = useState('')
   const [, forceTick] = useState(0)
-  const [paneTfs, setPaneTfs] = useState<number[]>([3600, 900])
+  const [panes, setPanes] = useState<PaneConfig[]>([
+    { tfSec: 3600, indCfg: defaultIndicatorsConfig() },
+    { tfSec: 900, indCfg: defaultIndicatorsConfig() },
+  ])
   const [sessionsCfg, setSessionsCfg] = useState<SessionsConfig>(() => defaultSessionsConfig())
-  const [indCfg, setIndCfg] = useState<IndicatorsConfig>(() => defaultIndicatorsConfig())
+  const [openIndPane, setOpenIndPane] = useState<number | null>(null)
   const applyingRef = useRef(false)
 
   // Load user settings (shared with main window's Dexie via same origin).
   useEffect(() => {
     void getSetting<SessionsConfig | null>('sessionsConfig', null).then(c => c && setSessionsCfg(c))
-    void getSetting<unknown>('indicatorsConfig', null).then(c => c && setIndCfg(migrateIndicatorsConfig(c)))
-    void getSetting<number[]>('replayWindowPaneTfs', [3600, 900]).then(v => setPaneTfs(v.slice(0, MAX_PANES)))
+    ;(async () => {
+      const stored = await getSetting<PaneConfig[] | null>('replayWindowPanes', null)
+      if (stored && stored.length > 0) {
+        setPanes(stored.slice(0, MAX_PANES).map(p => ({
+          tfSec: p.tfSec ?? 900,
+          indCfg: migrateIndicatorsConfig(p.indCfg),
+        })))
+        return
+      }
+      // Migrate from the pre-1.5.1 flat-timeframe key.
+      const [oldTfs, sharedInd] = await Promise.all([
+        getSetting<number[]>('replayWindowPaneTfs', [3600, 900]),
+        getSetting<unknown>('indicatorsConfig', null),
+      ])
+      const seed = sharedInd ? migrateIndicatorsConfig(sharedInd) : defaultIndicatorsConfig()
+      setPanes(oldTfs.slice(0, MAX_PANES).map(t => ({ tfSec: t, indCfg: seed })))
+    })()
   }, [])
-  useEffect(() => { void setSetting('replayWindowPaneTfs', paneTfs) }, [paneTfs])
+  useEffect(() => { void setSetting('replayWindowPanes', panes) }, [panes])
 
   // Bootstrap: read the session config the main window wrote before it called
   // window.open. Then either wait for a hello message from the primary or ask
@@ -94,9 +118,15 @@ export default function ReplayWindow() {
   }, [mirror])
 
   const setPaneTf = useCallback((i: number, sec: number) =>
-    setPaneTfs(t => t.map((v, k) => k === i ? sec : v)), [])
-  const addPane = () => setPaneTfs(t => t.length >= MAX_PANES ? t : [...t, t[t.length - 1] ?? 900])
-  const removePane = (i: number) => setPaneTfs(t => t.length <= 1 ? t : t.filter((_, k) => k !== i))
+    setPanes(p => p.map((v, k) => k === i ? { ...v, tfSec: sec } : v)), [])
+  const setPaneIndCfg = useCallback((i: number, indCfg: IndicatorsConfig) =>
+    setPanes(p => p.map((v, k) => k === i ? { ...v, indCfg } : v)), [])
+  const addPane = () => setPanes(p => {
+    if (p.length >= MAX_PANES) return p
+    const last = p[p.length - 1]
+    return [...p, { tfSec: last?.tfSec ?? 900, indCfg: last?.indCfg ?? defaultIndicatorsConfig() }]
+  })
+  const removePane = (i: number) => setPanes(p => p.length <= 1 ? p : p.filter((_, k) => k !== i))
 
   const allTfs = useMemo(() => DEFAULT_TFS.slice().sort((a, b) => a.sec - b.sec), [])
 
@@ -130,11 +160,14 @@ export default function ReplayWindow() {
         {[1, 2, 3].map(n => (
           <button
             key={n}
-            className={`tab ${paneTfs.length === n ? 'tab-on' : 'tab-off'}`}
-            onClick={() => setPaneTfs(t => {
-              if (n === t.length) return t
-              if (n > t.length) return [...t, ...Array(n - t.length).fill(t[t.length - 1] ?? 900)]
-              return t.slice(0, n)
+            className={`tab ${panes.length === n ? 'tab-on' : 'tab-off'}`}
+            onClick={() => setPanes(p => {
+              if (n === p.length) return p
+              if (n > p.length) {
+                const seed = p[p.length - 1] ?? { tfSec: 900, indCfg: defaultIndicatorsConfig() }
+                return [...p, ...Array(n - p.length).fill(0).map(() => ({ tfSec: seed.tfSec, indCfg: seed.indCfg }))]
+              }
+              return p.slice(0, n)
             })}
           >
             {n}
@@ -142,31 +175,51 @@ export default function ReplayWindow() {
         ))}
       </div>
 
-      <div className={`flex-1 min-h-0 p-2 grid gap-2 ${paneTfs.length === 1 ? 'grid-cols-1' : paneTfs.length === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
-        {paneTfs.map((paneTf, i) => (
+      <div className={`flex-1 min-h-0 p-2 grid gap-2 ${panes.length === 1 ? 'grid-cols-1' : panes.length === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+        {panes.map((pane, i) => (
           <div key={i} className="flex flex-col rounded-lg overflow-hidden border border-white/10 min-w-0 min-h-0">
-            <div className="flex items-center gap-1 px-2 py-1 border-b border-hairline bg-surface/60 flex-wrap">
+            <div className="relative flex items-center gap-1 px-2 py-1 border-b border-hairline bg-surface/60 flex-wrap">
               {allTfs.map(t => (
                 <button
                   key={t.sec}
-                  className={`tab ${t.sec === paneTf ? 'tab-on' : 'tab-off'} !text-[11px] !py-0.5`}
+                  className={`tab ${t.sec === pane.tfSec ? 'tab-on' : 'tab-off'} !text-[11px] !py-0.5`}
                   onClick={() => setPaneTf(i, t.sec)}
                 >{t.label}</button>
               ))}
               <div className="flex-1" />
-              {paneTfs.length < MAX_PANES && i === paneTfs.length - 1 && (
+              <button
+                className={`tab ${pane.indCfg.showVolume ? 'tab-on' : 'tab-off'} !text-[11px] !py-0.5`}
+                title="Show/hide volume on this chart"
+                onClick={() => setPaneIndCfg(i, { ...pane.indCfg, showVolume: !pane.indCfg.showVolume })}
+              >Vol</button>
+              <button
+                className={`tab ${openIndPane === i ? 'tab-on' : 'tab-off'} !text-[11px] !py-0.5`}
+                title="Indicators for this chart"
+                onClick={() => setOpenIndPane(v => v === i ? null : i)}
+              >ƒ {pane.indCfg.active.length > 0 && <span className="text-accent">·{pane.indCfg.active.length}</span>}</button>
+              {panes.length < MAX_PANES && i === panes.length - 1 && (
                 <button className="tab tab-off !text-[11px] !py-0.5" onClick={addPane}>+ chart</button>
               )}
-              {paneTfs.length > 1 && (
+              {panes.length > 1 && (
                 <button className="tab tab-off !text-[11px] !py-0.5 hover:!text-down" onClick={() => removePane(i)}>×</button>
+              )}
+              {openIndPane === i && (
+                <IndicatorsPanel
+                  config={pane.indCfg}
+                  onChange={c => setPaneIndCfg(i, c)}
+                  onClose={() => setOpenIndPane(null)}
+                  sessionsEnabled={sessionsCfg.enabled}
+                  onToggleSessions={on => setSessionsCfg({ ...sessionsCfg, enabled: on })}
+                  onEditSessions={() => setOpenIndPane(null)}
+                />
               )}
             </div>
             <div className="flex-1 min-h-0">
               <ReplayChart
                 engine={mirror}
-                tfSec={paneTf}
+                tfSec={pane.tfSec}
                 sessions={sessionsCfg}
-                indicators={indCfg}
+                indicators={pane.indCfg}
                 onStopsDragged={noopOnStopsDragged}
               />
             </div>
