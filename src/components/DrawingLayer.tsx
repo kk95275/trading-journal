@@ -32,6 +32,7 @@ interface Props {
 type DragState =
   | { mode: 'move'; id: number; startX: number; startY: number; origA: Anchor; origB?: Anchor }
   | { mode: 'a' | 'b'; id: number }
+  | { mode: 'left' | 'right'; id: number } // rect side-edge drag: moves the anchor sitting on that side
 
 interface Editing {
   x: number
@@ -207,20 +208,35 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
           ctx.textAlign = 'left'
         }
       } else {
-        const x = Math.min(xa, xb), y = Math.min(ya, yb)
-        const rw = Math.abs(xb - xa), rh = Math.abs(yb - ya)
+        // Rect: extend flags override the horizontal edges to pane boundaries.
+        const anchorLeftX = Math.min(xa, xb), anchorRightX = Math.max(xa, xb)
+        const xLeft = d.extendLeft ? 0 : anchorLeftX
+        const xRight = d.extendRight ? paneW : anchorRightX
+        const y = Math.min(ya, yb)
+        const rw = xRight - xLeft, rh = Math.abs(yb - ya)
         ctx.globalAlpha = 0.13
-        ctx.fillRect(x, y, rw, rh)
+        ctx.fillRect(xLeft, y, rw, rh)
         ctx.globalAlpha = 1
-        ctx.strokeRect(x, y, rw, rh)
+        ctx.strokeRect(xLeft, y, rw, rh)
         if (d.text) {
           const lines = d.text.split('\n').length
-          const tx = d.textH === 'center' ? x + rw / 2 : d.textH === 'right' ? x + rw - 5 : x + 5
+          const tx = d.textH === 'center' ? xLeft + rw / 2 : d.textH === 'right' ? xLeft + rw - 5 : xLeft + 5
           const ty = d.textV === 'middle' ? y + rh / 2 - (lines * 14) / 2 + 2 : d.textV === 'bottom' ? y + rh - lines * 14 - 3 : y + 4
           ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
           drawText(ctx, d.text, tx, ty, rw - 10)
           ctx.textAlign = 'left'
         }
+        if (selected) {
+          // Corner handles at the actual anchor positions (not the extended edges).
+          handle(ctx, xa, ya, d.color)
+          handle(ctx, xb, yb, d.color)
+          // Side handles: mid-edge circles for extending / dragging horizontally.
+          const midY = (ya + yb) / 2
+          handle(ctx, xLeft, midY, d.color, !!d.extendLeft)
+          handle(ctx, xRight, midY, d.color, !!d.extendRight)
+          return
+        }
+        return
       }
       if (selected) {
         handle(ctx, xa, ya, d.color)
@@ -245,14 +261,25 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
 
   /* ---------- hit testing (pixel space) ---------- */
 
-  const hitTest = useCallback((x: number, y: number): { d: Drawing; part: 'a' | 'b' | 'body' } | null => {
+  const hitTest = useCallback((x: number, y: number): { d: Drawing; part: 'a' | 'b' | 'body' | 'left' | 'right' } | null => {
     const ds = engine.drawings
+    const paneW = chart.timeScale().width()
     for (let i = ds.length - 1; i >= 0; i--) {
       const d = ds[i]
       const xa = timeToX(d.a.time), ya = priceToY(d.a.price)
       const xb = d.b ? timeToX(d.b.time) : null
       const yb = d.b ? priceToY(d.b.price) : null
       if (d.id === selRef.current && xa !== null && ya !== null) {
+        // Rect side handles first — they sit at pane edges when extended and
+        // should intercept before the underlying border hit.
+        if (d.kind === 'rect' && xb !== null && yb !== null) {
+          const anchorLeftX = Math.min(xa, xb), anchorRightX = Math.max(xa, xb)
+          const xLeft = d.extendLeft ? 0 : anchorLeftX
+          const xRight = d.extendRight ? paneW : anchorRightX
+          const midY = (ya + yb) / 2
+          if (Math.hypot(x - xLeft, y - midY) < HIT) return { d, part: 'left' }
+          if (Math.hypot(x - xRight, y - midY) < HIT) return { d, part: 'right' }
+        }
         if (Math.hypot(x - xa, y - ya) < HIT) return { d, part: 'a' }
         if (xb !== null && yb !== null && Math.hypot(x - xb, y - yb) < HIT) return { d, part: 'b' }
       }
@@ -264,7 +291,10 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
         if (d.kind === 'trend') {
           if (distToSegment(x, y, xa, ya, xb, yb) < HIT) return { d, part: 'body' }
         } else {
-          const x1 = Math.min(xa, xb), x2 = Math.max(xa, xb), y1 = Math.min(ya, yb), y2 = Math.max(ya, yb)
+          const anchorLeftX = Math.min(xa, xb), anchorRightX = Math.max(xa, xb)
+          const x1 = d.extendLeft ? 0 : anchorLeftX
+          const x2 = d.extendRight ? paneW : anchorRightX
+          const y1 = Math.min(ya, yb), y2 = Math.max(ya, yb)
           const onBorder =
             (Math.abs(x - x1) < HIT || Math.abs(x - x2) < HIT) && y > y1 - HIT && y < y2 + HIT ||
             (Math.abs(y - y1) < HIT || Math.abs(y - y2) < HIT) && x > x1 - HIT && x < x2 + HIT
@@ -274,7 +304,7 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
       }
     }
     return null
-  }, [engine, timeToX, priceToY])
+  }, [engine, chart, timeToX, priceToY])
 
   /* ---------- pointer interaction (capture phase) ---------- */
 
@@ -369,6 +399,23 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
         }
         d.a = shift(drag.origA)
         if (drag.origB) d.b = shift(drag.origB)
+      } else if (drag.mode === 'left' || drag.mode === 'right') {
+        // Rect side-edge drag: only the time of whichever anchor sits on that
+        // side is updated (price stays put). If the rect was extended on that
+        // side, dragging turns the extension off — matches TradingView UX.
+        if (d.kind !== 'rect' || !d.b) return
+        const anchor = pointToSnappedAnchor(x, y)
+        if (!anchor) return
+        const xa = timeToX(d.a.time)
+        const xb = timeToX(d.b.time)
+        if (xa === null || xb === null) return
+        // Which anchor is currently on the drag side?
+        const wantMax = drag.mode === 'right'
+        const aIsSide = wantMax ? xa >= xb : xa <= xb
+        if (aIsSide) d.a = { ...d.a, time: anchor.time }
+        else d.b = { ...d.b, time: anchor.time }
+        if (drag.mode === 'left') d.extendLeft = false
+        else d.extendRight = false
       } else {
         const anchor = pointToSnappedAnchor(x, y)
         if (anchor) {
@@ -503,6 +550,26 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     }
   }
 
+  // Selected rectangle (if any) — powers the visibility + state of the extend
+  // buttons at the bottom of the toolbar.
+  const selectedRect = selectedId !== null
+    ? engine.drawings.find(d => d.id === selectedId && d.kind === 'rect')
+    : undefined
+
+  const toggleExtend = (side: 'left' | 'right' | 'both') => {
+    if (!selectedRect) return
+    if (side === 'both') {
+      const on = !(selectedRect.extendLeft && selectedRect.extendRight)
+      selectedRect.extendLeft = on
+      selectedRect.extendRight = on
+    } else if (side === 'left') {
+      selectedRect.extendLeft = !selectedRect.extendLeft
+    } else {
+      selectedRect.extendRight = !selectedRect.extendRight
+    }
+    redraw()
+  }
+
   const TOOLS: { key: Tool; icon: string; title: string }[] = [
     { key: 'cursor', icon: '⊹', title: 'Select / move (Esc)' },
     { key: 'trend', icon: '╱', title: 'Trendline — click start, click end' },
@@ -578,6 +645,38 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
         >
           ✕
         </button>
+        {selectedRect && (
+          <>
+            <div className="h-px bg-hairline my-0.5" />
+            <button
+              title="Extend rectangle left to the pane edge"
+              className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
+                selectedRect.extendLeft ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
+              }`}
+              onClick={() => toggleExtend('left')}
+            >
+              ⇤
+            </button>
+            <button
+              title="Extend rectangle right to the pane edge (great for open zones)"
+              className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
+                selectedRect.extendRight ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
+              }`}
+              onClick={() => toggleExtend('right')}
+            >
+              ⇥
+            </button>
+            <button
+              title="Extend both sides to the pane edges"
+              className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
+                selectedRect.extendLeft && selectedRect.extendRight ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
+              }`}
+              onClick={() => toggleExtend('both')}
+            >
+              ⇹
+            </button>
+          </>
+        )}
       </div>
       {editing && (() => {
         const target = editing.id !== undefined ? engine.drawings.find(dd => dd.id === editing.id) : undefined
@@ -644,9 +743,9 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
 
 /* ---------- canvas helpers ---------- */
 
-function handle(ctx: CanvasRenderingContext2D, x: number, y: number, color: string) {
+function handle(ctx: CanvasRenderingContext2D, x: number, y: number, color: string, filled = false) {
   ctx.save()
-  ctx.fillStyle = '#1a1a19'
+  ctx.fillStyle = filled ? color : '#1a1a19'
   ctx.strokeStyle = color
   ctx.lineWidth = 1.5
   ctx.beginPath()

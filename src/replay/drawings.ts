@@ -23,6 +23,8 @@ export interface Drawing {
   text?: string
   textH?: TextH // rect: inside · hline/trend: along the line (default left)
   textV?: TextV // rect: inside · hline/trend: above/on/below (default top)
+  extendLeft?: boolean  // rect only — draws left edge at pane x=0 regardless of anchor time
+  extendRight?: boolean // rect only — draws right edge at pane width; useful for "zone continues"
 }
 
 export const DRAW_COLORS = ['#3987e5', '#eb6834', '#0ca30c', '#d03b3b', '#9085e9', '#e8e6df']
