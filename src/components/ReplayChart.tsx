@@ -1,12 +1,14 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import {
   createChart, CrosshairMode, LineStyle,
   type CandlestickData, type HistogramData, type IChartApi, type IPriceLine,
   type ISeriesApi, type SeriesMarker, type UTCTimestamp,
 } from 'lightweight-charts'
+import { useLiveQuery } from 'dexie-react-hooks'
 import type { Bar } from '../lib/types'
 import { specFor } from '../lib/symbols'
 import * as data from '../data/dataService'
+import { db, type CustomIndicatorDef } from '../db'
 import type { IReplayView } from '../replay/engine'
 import type { SessionsConfig } from '../replay/sessions'
 import { isOscillator, OverlayManager, type IndicatorsConfig } from '../replay/indicators'
@@ -114,10 +116,19 @@ const ReplayChart = forwardRef<ChartHandle, Props>(function ReplayChart({ engine
     }
   }, [])
 
-  // indicator overlays: full re-sync on config / data changes
+  // Custom indicator definitions live in Dexie. useLiveQuery so a rename/edit
+  // in Settings reactively re-syncs every chart that references the def.
+  const customDefsList = useLiveQuery(() => db.customIndicators.toArray(), [], [] as CustomIndicatorDef[])
+  const customDefsMap = useMemo(() => {
+    const m = new Map<number, CustomIndicatorDef>()
+    for (const d of customDefsList) if (d.id !== undefined) m.set(d.id, d)
+    return m
+  }, [customDefsList])
+
+  // indicator overlays: full re-sync on config / data / custom-def changes
   useEffect(() => {
-    if (indicators) overlayMgrRef.current?.sync(indicators, aggRef.current)
-  }, [indicators, dataVersion])
+    if (indicators) overlayMgrRef.current?.sync(indicators, aggRef.current, customDefsMap)
+  }, [indicators, dataVersion, customDefsMap])
 
   // volume visibility
   useEffect(() => {

@@ -5,8 +5,10 @@
 // candle can mutate without drift).
 import { LineStyle, type IChartApi, type ISeriesApi, type UTCTimestamp } from 'lightweight-charts'
 import type { Bar } from '../lib/types'
+import type { CustomIndicatorDef } from '../db'
+import { runCustomIndicator } from './customEval'
 
-export type IndicatorKind = 'ma' | 'bb' | 'vwap' | 'rsi' | 'macd'
+export type IndicatorKind = 'ma' | 'bb' | 'vwap' | 'rsi' | 'macd' | 'custom'
 
 export interface ActiveIndicator {
   id: string
@@ -18,6 +20,9 @@ export interface ActiveIndicator {
   fast?: number          // macd
   slow?: number          // macd
   signal?: number        // macd
+  // custom
+  customDefId?: number   // references db.customIndicators.id
+  customName?: string    // cached display name (kept in sync when definition changes)
 }
 
 export interface IndicatorsConfig {
@@ -40,6 +45,7 @@ export function indicatorLabel(a: ActiveIndicator): string {
     case 'vwap': return 'VWAP (daily)'
     case 'rsi': return `RSI ${a.length ?? 14}`
     case 'macd': return `MACD ${a.fast ?? 12}/${a.slow ?? 26}/${a.signal ?? 9}`
+    case 'custom': return a.customName ?? 'Custom'
   }
 }
 
@@ -129,6 +135,7 @@ function vwapAt(bars: Bar[], i: number): number {
 
 interface MaState { def: ActiveIndicator; s: ISeriesApi<'Line'>; lastIdx: number; prevEma: number; lastEma: number }
 interface BbState { def: ActiveIndicator; up: ISeriesApi<'Line'>; mid: ISeriesApi<'Line'>; lo: ISeriesApi<'Line'> }
+interface CustomState { def: ActiveIndicator; s: ISeriesApi<'Line'>; code: string }
 
 export class OverlayManager {
   private chart: IChartApi
@@ -136,6 +143,7 @@ export class OverlayManager {
   private mas: MaState[] = []
   private bbs: BbState[] = []
   private vwaps: ISeriesApi<'Line'>[] = []
+  private customs: CustomState[] = []
 
   constructor(chart: IChartApi) {
     this.chart = chart
@@ -158,9 +166,10 @@ export class OverlayManager {
     this.mas = []
     this.bbs = []
     this.vwaps = []
+    this.customs = []
   }
 
-  sync(cfg: IndicatorsConfig, bars: Bar[]) {
+  sync(cfg: IndicatorsConfig, bars: Bar[], customDefs?: Map<number, CustomIndicatorDef>) {
     this.clear()
     for (const def of cfg.active) {
       if (def.kind === 'ma') {
@@ -197,6 +206,12 @@ export class OverlayManager {
         const s = this.addLine(def.color, LineStyle.Solid)
         s.setData(vwapSeries(bars))
         this.vwaps.push(s)
+      } else if (def.kind === 'custom' && customDefs) {
+        const cd = def.customDefId !== undefined ? customDefs.get(def.customDefId) : undefined
+        if (!cd) continue // definition deleted — instance is orphaned; skip silently
+        const s = this.addLine(def.color, LineStyle.Solid)
+        this.customs.push({ def, s, code: cd.code })
+        renderCustom(s, bars, cd.code)
       }
     }
   }
@@ -241,11 +256,35 @@ export class OverlayManager {
       b.lo.update({ time: t, value: mean - mult * sd })
     }
     for (const s of this.vwaps) s.update({ time: t, value: vwapAt(bars, i) })
+    // Custom indicators recompute from scratch on every tick — user code
+    // isn't guaranteed to be incremental. For typical replay bar counts
+    // (a few thousand at most) this is fast enough; if it ever becomes a
+    // bottleneck, we can add an incremental callback to the def contract.
+    for (const c of this.customs) renderCustom(c.s, bars, c.code)
   }
 
   destroy() {
     this.clear()
   }
+}
+
+/** Compile + run a user-authored indicator, plot as a line series. */
+function renderCustom(series: ISeriesApi<'Line'>, bars: Bar[], code: string) {
+  const { values, error } = runCustomIndicator(code, bars)
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[custom indicator error]', error)
+    series.setData([])
+    return
+  }
+  const out: LinePoint[] = []
+  for (let i = 0; i < bars.length; i++) {
+    const v = values[i]
+    if (typeof v === 'number' && isFinite(v)) {
+      out.push({ time: bars[i].time as UTCTimestamp, value: v })
+    }
+  }
+  series.setData(out)
 }
 
 /* ---------------- oscillator math (RSI / MACD) ---------------- */

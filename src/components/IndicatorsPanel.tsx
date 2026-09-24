@@ -1,6 +1,8 @@
 // Indicators menu with side tabs: Standard (built-ins, add-flow with settings →
 // Add/Cancel) and Custom (our own indicators, e.g. Sessions).
 import { useState } from 'react'
+import { useLiveQuery } from 'dexie-react-hooks'
+import { db, type CustomIndicatorDef } from '../db'
 import {
   INDICATOR_COLORS, indicatorLabel,
   type ActiveIndicator, type IndicatorKind, type IndicatorsConfig,
@@ -32,6 +34,17 @@ function newDraft(kind: IndicatorKind, existing?: ActiveIndicator): ActiveIndica
     case 'vwap': return { ...base, color: '#e87ba4' }
     case 'rsi': return { ...base, length: 14, color: '#9085e9' }
     case 'macd': return { ...base, fast: 12, slow: 26, signal: 9 }
+    case 'custom': return { ...base }
+  }
+}
+
+function newCustomDraft(def: CustomIndicatorDef): ActiveIndicator {
+  return {
+    id: `i${Date.now() % 1e8}`,
+    kind: 'custom',
+    color: def.color,
+    customDefId: def.id,
+    customName: def.name,
   }
 }
 
@@ -68,6 +81,7 @@ export default function IndicatorsPanel({ config, onChange, onClose, sessionsEna
   const [tab, setTab] = useState<'standard' | 'custom'>('standard')
   const [draft, setDraft] = useState<ActiveIndicator | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const userCustomDefs = useLiveQuery(() => db.customIndicators.toArray(), [], [] as CustomIndicatorDef[])
 
   const upd = (patch: Partial<ActiveIndicator>) => setDraft(d => d && { ...d, ...patch })
 
@@ -144,7 +158,7 @@ export default function IndicatorsPanel({ config, onChange, onClose, sessionsEna
             {draft ? (
               <div className="border border-accent/40 rounded-lg p-3 space-y-3">
                 <div className="text-xs font-semibold text-ink">
-                  {editingId ? 'Edit' : 'Add'} {CATALOG.find(c => c.kind === draft.kind)?.name}
+                  {editingId ? 'Edit' : 'Add'} {draft.kind === 'custom' ? (draft.customName ?? 'Custom') : CATALOG.find(c => c.kind === draft.kind)?.name}
                 </div>
                 <div className="flex flex-wrap items-center gap-3">
                   {draft.kind === 'ma' && (
@@ -171,6 +185,7 @@ export default function IndicatorsPanel({ config, onChange, onClose, sessionsEna
                     </>
                   )}
                   {draft.kind === 'vwap' && <span className="text-[11px] text-muted">Anchored to each GMT day.</span>}
+                  {draft.kind === 'custom' && <span className="text-[11px] text-muted">User-authored — edit code in Settings → Custom indicators.</span>}
                   <ColorDots value={draft.color} onPick={c => upd({ color: c })} />
                 </div>
                 <div className="flex gap-2 justify-end">
@@ -194,6 +209,30 @@ export default function IndicatorsPanel({ config, onChange, onClose, sessionsEna
                     </button>
                   ))}
                 </div>
+
+                {userCustomDefs.length > 0 && (
+                  <>
+                    <div className="text-[11px] text-muted mt-3 mb-1.5">Your custom indicators</div>
+                    <div className="space-y-1">
+                      {userCustomDefs.map(d => (
+                        <button
+                          key={d.id}
+                          className="w-full flex items-center gap-2 text-left px-2.5 py-1.5 rounded-lg hover:bg-white/5 transition-colors"
+                          onClick={() => { setDraft(newCustomDraft(d)); setEditingId(null) }}
+                        >
+                          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: d.color }} />
+                          <span className="text-xs text-ink font-medium">{d.name}</span>
+                          <span className="ml-auto text-muted text-xs">+</span>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {userCustomDefs.length === 0 && (
+                  <p className="text-[11px] text-muted mt-3">
+                    Want your own? <span className="text-ink2">Settings → Custom indicators</span> lets you write overlay indicators in JavaScript.
+                  </p>
+                )}
               </div>
             )}
           </>

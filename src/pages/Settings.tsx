@@ -9,6 +9,7 @@ import { checkForUpdates, getAppVersion, installUpdate, useUpdaterStatus } from 
 import { Modal, PageHead } from '../components/ui'
 import InstrumentsCard from '../components/InstrumentsCard'
 import AISettingsCard from '../components/AISettingsCard'
+import CustomIndicatorsCard from '../components/CustomIndicatorsCard'
 
 export default function Settings() {
   const accounts = useLiveQuery(() => db.accounts.toArray(), [], [])
@@ -157,6 +158,8 @@ export default function Settings() {
         </div>
 
         <AISettingsCard />
+
+        <CustomIndicatorsCard />
 
         <SyncCard />
         {isElectron && <UpdatesCard />}

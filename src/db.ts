@@ -18,6 +18,16 @@ export interface AIConversation {
   messages: { role: 'user' | 'assistant' | 'system'; content: string; ts: number }[]
 }
 
+export interface CustomIndicatorDef {
+  id?: number
+  name: string           // shown in the picker and the on-chart label
+  code: string           // JS body — see src/replay/customEval.ts for the contract
+  color: string          // default line color (each instance can override)
+  overlay: boolean       // true for MVP — draws on the price chart
+  createdAt: number
+  updatedAt: number
+}
+
 class TradingJournalDB extends Dexie {
   accounts!: Table<Account, number>
   trades!: Table<Trade, number>
@@ -25,6 +35,7 @@ class TradingJournalDB extends Dexie {
   journal!: Table<JournalEntry, number>
   settings!: Table<SettingRow, string>
   aiConversations!: Table<AIConversation, number>
+  customIndicators!: Table<CustomIndicatorDef, number>
 
   constructor() {
     super('trading-journal')
@@ -37,6 +48,9 @@ class TradingJournalDB extends Dexie {
     })
     this.version(2).stores({
       aiConversations: '++id, updatedAt',
+    })
+    this.version(3).stores({
+      customIndicators: '++id, name, updatedAt',
     })
   }
 }
