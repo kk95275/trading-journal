@@ -6,10 +6,18 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { IChartApi, ISeriesApi, Logical } from 'lightweight-charts'
 import type { Bar } from '../lib/types'
 import type { IReplayView } from '../replay/engine'
+import { getSetting, setSetting } from '../db'
 import {
   DRAW_COLORS, distToSegment, nearestIndex, nextDrawingId,
   type Anchor, type Drawing, type TextH, type TextV, type Tool,
 } from '../replay/drawings'
+
+// TradingView-style magnet. off = free cursor. weak = snap only when the
+// cursor is within WEAK_MAGNET_PX of an OHLC line. strong = always snap to
+// the nearest of the bar's four prices. Persisted across sessions.
+type MagnetMode = 'off' | 'weak' | 'strong'
+const WEAK_MAGNET_PX = 20
+const MAGNET_STORAGE_KEY = 'drawingMagnetMode'
 
 interface Props {
   container: HTMLElement
@@ -43,14 +51,25 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
   const [color, setColor] = useState(DRAW_COLORS[0])
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [editing, setEditing] = useState<Editing | null>(null)
+  const [magnet, setMagnet] = useState<MagnetMode>('off')
   const pendingRef = useRef<{ a: Anchor; hover: Anchor | null } | null>(null)
   const dragRef = useRef<DragState | null>(null)
   const toolRef = useRef(tool)
   const colorRef = useRef(color)
   const selRef = useRef(selectedId)
+  const magnetRef = useRef(magnet)
   toolRef.current = tool
   colorRef.current = color
   selRef.current = selectedId
+  magnetRef.current = magnet
+
+  // Persist magnet mode. Read once on mount; write on every change.
+  useEffect(() => {
+    void getSetting<MagnetMode>(MAGNET_STORAGE_KEY, 'off').then(m => {
+      if (m === 'off' || m === 'weak' || m === 'strong') setMagnet(m)
+    })
+  }, [])
+  useEffect(() => { void setSetting(MAGNET_STORAGE_KEY, magnet) }, [magnet])
 
   /* ---------- coordinate mapping ---------- */
 
@@ -78,6 +97,39 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     const idx = Math.max(0, Math.min(bars.length - 1, Math.round(logical as number)))
     return { time: bars[idx].time, price: +price }
   }, [chart, series, getBars])
+
+  /**
+   * TradingView-style magnet: when the mouse is near a candle's O/H/L/C, force
+   * the anchor's price to that exact value. `weak` snaps only if the cursor Y
+   * is within WEAK_MAGNET_PX of one of the four price lines; `strong` always
+   * snaps to whichever of the four is closest. Time is left alone — it's
+   * already snapped to the candle's index by pointToAnchor.
+   */
+  const snapAnchor = useCallback((x: number, y: number, a: Anchor): Anchor => {
+    const mode = magnetRef.current
+    if (mode === 'off') return a
+    const bars = getBars()
+    if (!bars.length) return a
+    const idx = nearestIndex(bars, a.time)
+    const bar = bars[idx]
+    if (!bar) return a
+    const options = [bar.high, bar.low, bar.open, bar.close]
+    let bestPrice = options[0]
+    let bestDistPx = Infinity
+    for (const p of options) {
+      const py = series.priceToCoordinate(p)
+      if (py === null) continue
+      const dPx = Math.abs(py - y)
+      if (dPx < bestDistPx) { bestDistPx = dPx; bestPrice = p }
+    }
+    if (mode === 'weak' && bestDistPx > WEAK_MAGNET_PX) return a
+    return { time: a.time, price: bestPrice }
+  }, [getBars, series])
+
+  const pointToSnappedAnchor = useCallback((x: number, y: number): Anchor | null => {
+    const a = pointToAnchor(x, y)
+    return a ? snapAnchor(x, y, a) : null
+  }, [pointToAnchor, snapAnchor])
 
   /* ---------- rendering ---------- */
 
@@ -246,7 +298,7 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
 
       if (t !== 'cursor') {
         consume(e)
-        const anchor = pointToAnchor(x, y)
+        const anchor = pointToSnappedAnchor(x, y)
         if (!anchor) return
         if (t === 'hline') {
           const d: Drawing = { id: nextDrawingId(), kind: 'hline', a: anchor, color: colorRef.current }
@@ -295,7 +347,7 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
       const pending = pendingRef.current
       if (pending) {
         consume(e)
-        pending.hover = pointToAnchor(x, y)
+        pending.hover = pointToSnappedAnchor(x, y)
         redraw()
         return
       }
@@ -318,7 +370,7 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
         d.a = shift(drag.origA)
         if (drag.origB) d.b = shift(drag.origB)
       } else {
-        const anchor = pointToAnchor(x, y)
+        const anchor = pointToSnappedAnchor(x, y)
         if (anchor) {
           if (drag.mode === 'a') d.a = anchor
           else if (d.b) d.b = anchor
@@ -357,7 +409,7 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
       container.removeEventListener('pointerup', onUp, true)
       container.removeEventListener('dblclick', onDblClick, true)
     }
-  }, [chart, container, engine, series, getBars, pointToAnchor, hitTest, redraw, editing])
+  }, [chart, container, engine, series, getBars, pointToSnappedAnchor, hitTest, redraw, editing])
 
   /* ---------- keyboard: delete / escape ---------- */
 
@@ -459,6 +511,13 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     { key: 'text', icon: 'T', title: 'Text note' },
   ]
 
+  const magnetNext: Record<MagnetMode, MagnetMode> = { off: 'weak', weak: 'strong', strong: 'off' }
+  const magnetLabel: Record<MagnetMode, string> = {
+    off: 'Magnet: off — click to enable weak snap',
+    weak: 'Magnet: weak — snaps to OHLC when cursor is near a price line (click to switch to strong)',
+    strong: 'Magnet: strong — always snaps to nearest OHLC of the bar under cursor (click to turn off)',
+  }
+
   return (
     <>
       <canvas ref={canvasRef} className="absolute inset-0 z-[3] pointer-events-none" style={{ width: '100%', height: '100%' }} />
@@ -486,6 +545,16 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
             <span className="w-3.5 h-3.5 rounded-full border border-black/40" style={{ background: c }} />
           </button>
         ))}
+        <div className="h-px bg-hairline my-0.5" />
+        <button
+          title={magnetLabel[magnet]}
+          className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
+            magnet === 'off' ? 'text-ink2 hover:bg-white/10' : magnet === 'weak' ? 'bg-warn/25 text-warn' : 'bg-accent text-white'
+          }`}
+          onClick={() => setMagnet(m => magnetNext[m])}
+        >
+          🧲
+        </button>
         <div className="h-px bg-hairline my-0.5" />
         <button
           title="Delete selected (Del)"
