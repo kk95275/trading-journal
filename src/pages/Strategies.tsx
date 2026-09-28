@@ -3,10 +3,11 @@
 // and get equity curve + stats + hourly breakdown. "Analyze with AI" pipes
 // the results through the same streamChat pipeline the journal uses.
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { Bar as BarChart, Bar as RCBar, BarChart as RCBarChart, CartesianGrid, Cell, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { db, type StrategyDef } from '../db'
+import Editor, { type OnMount } from '@monaco-editor/react'
+import { db, getSetting, setSetting, type StrategyDef } from '../db'
 import { getBars, chunksFor } from '../data/dataService'
 import { fmtDate, fmtUsd, fmtR, fmtDateTime, fmtPct, fmtDuration } from '../lib/gold'
 import { useSymbolList } from '../lib/instruments'
@@ -18,6 +19,7 @@ import { Empty, PageHead, PnlText } from '../components/ui'
 import { runBacktest, hourlyBreakdown, dowBreakdown, type BacktestResult, type RunProgress } from '../strategy/runner'
 import { loadPyodideRuntime, onPyodideStatus, pyodideStatus, type LoadStatus } from '../strategy/pyodide'
 import { STRATEGY_EXAMPLES } from '../strategy/examples'
+import { lintPython, autoFix, type LintIssue } from '../strategy/lint'
 
 const AXIS = '#898781'
 const GRID = '#2c2c2a'
@@ -42,6 +44,13 @@ export default function Strategies() {
   const [progress, setProgress] = useState<RunProgress | null>(null)
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<BacktestResult | null>(null)
+  const [issues, setIssues] = useState<LintIssue[]>([])
+  const [autoFixOn, setAutoFixOn] = useState(true)
+  // Handles used by lint + autofix to reach into Monaco. `any` here because
+  // monaco types aren't exported from the react wrapper without importing
+  // 'monaco-editor' (which we lazy-load; keeping the type dep-free is fine).
+  const editorRef = useRef<any>(null)
+  const monacoRef = useRef<any>(null)
 
   const active = strategies.find(s => s.id === activeId) ?? null
 
@@ -58,6 +67,39 @@ export default function Strategies() {
   }, [strategies, activeId])
 
   useEffect(() => onPyodideStatus(setPyStatus), [])
+
+  // Auto-fix on save toggle — remembered per user.
+  useEffect(() => {
+    void getSetting<boolean>('strategyAutoFix', true).then(setAutoFixOn)
+  }, [])
+  useEffect(() => { void setSetting('strategyAutoFix', autoFixOn) }, [autoFixOn])
+
+  // Debounced live lint. Fires 400ms after typing stops. Warms pyodide the
+  // first time (~10 MB download) — same runtime the backtest uses.
+  useEffect(() => {
+    if (!draft) { setIssues([]); return }
+    const code = draft.code
+    const handle = window.setTimeout(async () => {
+      const found = await lintPython(code)
+      setIssues(found)
+      // Push markers into Monaco so squiggles appear inline.
+      const editor = editorRef.current, monaco = monacoRef.current
+      if (editor && monaco) {
+        const model = editor.getModel()
+        if (model) {
+          monaco.editor.setModelMarkers(model, 'py-lint', found.map(iss => ({
+            severity: iss.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+            message: iss.message,
+            startLineNumber: iss.line,
+            startColumn: iss.column,
+            endLineNumber: iss.line,
+            endColumn: iss.endColumn ?? iss.column + 1,
+          })))
+        }
+      }
+    }, 400)
+    return () => window.clearTimeout(handle)
+  }, [draft?.code, draft?.id])
 
   const startNew = () => {
     const now = Date.now()
@@ -78,7 +120,11 @@ export default function Strategies() {
 
   const save = async () => {
     if (!draft) return
-    const rec = { ...draft, updatedAt: Date.now() }
+    // Apply auto-fix silently on save if the toggle is on. Only the whitespace
+    // is touched — semantics stay identical (see autoFix() docstring).
+    const nextCode = autoFixOn ? autoFix(draft.code) : draft.code
+    const rec = { ...draft, code: nextCode, updatedAt: Date.now() }
+    if (nextCode !== draft.code) setDraft({ ...draft, code: nextCode })
     if (rec.id !== undefined) {
       await db.strategies.update(rec.id, rec)
     } else {
@@ -86,6 +132,18 @@ export default function Strategies() {
       setActiveId(id as number)
     }
   }
+
+  const formatNow = () => {
+    if (!draft) return
+    setDraft({ ...draft, code: autoFix(draft.code) })
+  }
+
+  const onEditorMount: OnMount = useCallback((editor, monaco) => {
+    editorRef.current = editor
+    monacoRef.current = monaco
+    // Ctrl/⌘+S formats + saves. Bypasses the browser's own save dialog.
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { void save() })
+  }, [autoFixOn, draft?.id])
 
   const del = async () => {
     if (!draft?.id) return
@@ -225,10 +283,11 @@ export default function Strategies() {
               </div>
 
               <div className="flex-1 min-h-0 grid grid-rows-[minmax(180px,1fr)_auto_minmax(200px,2fr)]">
-                {/* Code editor */}
+                {/* Code editor (Monaco — same one VS Code uses) */}
                 <div className="border-b border-hairline flex flex-col min-h-0">
                   <div className="flex items-center gap-2 px-3 py-1 text-[11px] text-muted flex-wrap">
-                    <span>Python (Pyodide) — <span className="text-ink2">def on_bar(ctx): …</span></span>
+                    <span>Python — <span className="text-ink2">def on_bar(ctx): …</span></span>
+                    <span className="mx-1 opacity-40">·</span>
                     <span>Load example:</span>
                     {STRATEGY_EXAMPLES.map((e, i) => (
                       <button key={i} className="btn-ghost !text-[11px] !py-0 !px-1.5"
@@ -236,22 +295,42 @@ export default function Strategies() {
                         title={e.description}
                       >{e.name}</button>
                     ))}
+                    <div className="flex-1" />
+                    <label className="flex items-center gap-1 text-[11px] text-ink2 cursor-pointer" title="When on, saves silently strip trailing whitespace, expand leading tabs to 4 spaces, and ensure a final newline. Semantics never change.">
+                      <input type="checkbox" className="accent-[#3987e5]" checked={autoFixOn} onChange={e => setAutoFixOn(e.target.checked)} />
+                      Auto-fix on save
+                    </label>
+                    <button className="btn-ghost !text-[11px] !py-0 !px-1.5" onClick={formatNow} title="Format now — same rules Auto-fix applies on save">Format</button>
                   </div>
-                  <textarea
-                    className="input !text-xs font-mono flex-1 !rounded-none !border-0 !border-t !border-hairline resize-none leading-snug"
-                    spellCheck={false}
-                    value={draft.code}
-                    onChange={e => setDraft(d => d && { ...d, code: e.target.value })}
-                    onKeyDown={e => {
-                      if (e.key === 'Tab') {
-                        e.preventDefault()
-                        const el = e.currentTarget
-                        const s = el.selectionStart, ee = el.selectionEnd
-                        setDraft(d => d && { ...d, code: d.code.slice(0, s) + '    ' + d.code.slice(ee) })
-                        requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = s + 4 })
-                      }
-                    }}
-                  />
+                  <div className="flex-1 min-h-0 border-t border-hairline">
+                    <Editor
+                      value={draft.code}
+                      onChange={v => setDraft(d => d && { ...d, code: v ?? '' })}
+                      language="python"
+                      theme="vs-dark"
+                      onMount={onEditorMount}
+                      options={{
+                        minimap: { enabled: false },
+                        fontSize: 12.5,
+                        fontFamily: 'ui-monospace, SFMono-Regular, Consolas, Menlo, monospace',
+                        tabSize: 4,
+                        insertSpaces: true,
+                        renderLineHighlight: 'gutter',
+                        scrollBeyondLastLine: false,
+                        smoothScrolling: true,
+                        wordWrap: 'off',
+                        automaticLayout: true,
+                        padding: { top: 8, bottom: 8 },
+                        lineNumbersMinChars: 3,
+                        overviewRulerBorder: false,
+                        // Keep the built-in Python language service; our lint layer feeds
+                        // markers separately via setModelMarkers so syntax errors show
+                        // with the same red squiggles you'd get in VS Code.
+                      }}
+                      loading={<div className="p-3 text-xs text-muted">Loading editor…</div>}
+                    />
+                  </div>
+                  <ProblemsStrip issues={issues} />
                 </div>
 
                 {/* Progress / Pyodide status */}
@@ -446,6 +525,28 @@ function MiniStat({ label, value, sub }: { label: string; value: React.ReactNode
       <div className="text-[10px] text-muted">{label}</div>
       <div className="text-sm font-semibold text-ink mt-0.5">{value}</div>
       {sub && <div className="text-[10px] text-muted mt-0.5">{sub}</div>}
+    </div>
+  )
+}
+
+function ProblemsStrip({ issues }: { issues: LintIssue[] }) {
+  if (issues.length === 0) {
+    return (
+      <div className="px-3 py-1 text-[11px] text-up border-t border-hairline bg-black/20 flex items-center gap-2">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-up" /> No problems.
+      </div>
+    )
+  }
+  return (
+    <div className="border-t border-hairline bg-black/20 max-h-24 overflow-y-auto">
+      {issues.map((iss, i) => (
+        <div key={i} className="flex items-baseline gap-2 px-3 py-1 text-[11px]">
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${iss.severity === 'error' ? 'bg-down' : 'bg-warn'}`} />
+          <span className={iss.severity === 'error' ? 'text-down' : 'text-warn'}>{iss.severity}</span>
+          <span className="text-muted">line {iss.line}:{iss.column}</span>
+          <span className="text-ink2">{iss.message}</span>
+        </div>
+      ))}
     </div>
   )
 }
