@@ -5,8 +5,11 @@
 // {runPython, callFunction, isReady} surface.
 
 // Pyodide version pinned so we don't get surprise breaking changes on cdnjs.
+// NB: cdnjs mirrors pyodide with a FLAT layout (no `/full/` subdirectory) —
+// files like pyodide.js and pyodide.asm.wasm sit directly under the version
+// directory. jsdelivr uses `/full/` but cdnjs doesn't.
 const PYODIDE_VERSION = '0.28.3'
-const PYODIDE_BASE = `https://cdnjs.cloudflare.com/ajax/libs/pyodide/${PYODIDE_VERSION}/full/`
+const PYODIDE_BASE = `https://cdnjs.cloudflare.com/ajax/libs/pyodide/${PYODIDE_VERSION}/`
 const PYODIDE_JS = `${PYODIDE_BASE}pyodide.js`
 
 // Pyodide attaches loadPyodide to window; we don't want to fight the global.
