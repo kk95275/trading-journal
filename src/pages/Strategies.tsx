@@ -254,10 +254,34 @@ export default function Strategies() {
       setProgress({ processed: 0, total: 0, message: 'Loading data…' })
       const chunks = await chunksFor(draft.symbol, '1m')
       if (!chunks.length) throw new Error(`No 1m data for ${draft.symbol}. Import it under Settings → Instruments.`)
-      const from = draft.from ?? chunks[0].from
-      const to = draft.to ?? chunks[chunks.length - 1].to
+      const availFrom = chunks[0].from
+      const availTo = chunks[chunks.length - 1].to
+      const totalManifestBars = chunks.reduce((s, c) => s + (c.bars ?? 0), 0)
+      // Fall back to the full available range when the user hasn't set from/to,
+      // and clamp any user-specified range that falls outside available data so
+      // a slightly-off date picker doesn't return zero bars.
+      const wantedFrom = draft.from ?? availFrom
+      const wantedTo   = draft.to   ?? availTo
+      const from = Math.max(wantedFrom, availFrom)
+      const to   = Math.min(wantedTo,   availTo)
+      if (from > to) {
+        throw new Error(
+          `The from/to range for ${draft.symbol} doesn't overlap any imported data.\n` +
+          `Requested: ${fmtDate(wantedFrom)} → ${fmtDate(wantedTo)}\n` +
+          `Available: ${fmtDate(availFrom)} → ${fmtDate(availTo)}\n` +
+          `Clear the from/to inputs to run against all data.`,
+        )
+      }
       const bars = await getBars(draft.symbol, '1m', from, to)
-      if (!bars.length) throw new Error('No bars in the selected range.')
+      if (!bars.length) {
+        throw new Error(
+          `Loaded 0 bars for ${draft.symbol} even though the manifest lists ${totalManifestBars.toLocaleString()} bars ` +
+          `across ${chunks.length} chunk(s).\n` +
+          `Requested window: ${fmtDate(from)} → ${fmtDate(to)}\n` +
+          `Available: ${fmtDate(availFrom)} → ${fmtDate(availTo)}\n` +
+          `If this is a fresh install, import 1m data under Settings → Instruments and try again.`,
+        )
+      }
 
       // Kick off pyodide load so its status flows to the UI even before runBacktest awaits it.
       void loadPyodideRuntime()
