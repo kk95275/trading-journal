@@ -101,6 +101,40 @@ def on_bar(ctx):
 `,
   },
   {
+    name: 'Multi-TF trend + entry',
+    description: 'Take entries on 5m only when the 1h and 4h EMAs both agree with the trade direction.',
+    code: `# Multi-timeframe trend filter.
+# Entry timeframe: 5m EMA 21 pullbacks in the direction of a stacked EMA trend.
+# Trend filter:    1h EMA 50 above/below 4h EMA 200 → direction bias.
+
+def on_bar(ctx):
+    # Aggregate the underlying 1m into higher timeframes on demand.
+    m5 = ctx.tf('5m')
+    h1 = ctx.tf('1h')
+    h4 = ctx.tf('4h')
+
+    # Need enough history on the slowest tf.
+    if len(h4.bars) < 200 or len(h1.bars) < 50 or len(m5.bars) < 21:
+        return
+
+    trend_up   = h1.closes[-2] > ema(h1.closes, 50)[-2] and h4.closes[-2] > ema(h4.closes, 200)[-2]
+    trend_down = h1.closes[-2] < ema(h1.closes, 50)[-2] and h4.closes[-2] < ema(h4.closes, 200)[-2]
+
+    e21 = ema(m5.closes, 21)
+    if not is_finite(e21[-1]):
+        return
+
+    if ctx.position is None:
+        # Long a wick down through the 5m EMA21 while the higher-tf trend is up.
+        if trend_up and m5.low <= e21[-1] <= m5.close:
+            entry = ctx.ask
+            ctx.buy(0.1, sl=entry * 0.997, tp=entry * 1.006)
+        elif trend_down and m5.high >= e21[-1] >= m5.close:
+            entry = ctx.bid
+            ctx.sell(0.1, sl=entry * 1.003, tp=entry * 0.994)
+`,
+  },
+  {
     name: 'MACD momentum',
     description: 'MACD-line crossing above signal in a positive-histogram regime.',
     code: `# MACD momentum entry, TP/SL scaled by the histogram magnitude.

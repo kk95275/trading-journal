@@ -101,6 +101,14 @@ const CONTRACT_HEADER =
 #   recent_closes(n), recent_highs(n), recent_lows(n), recent_opens(n),
 #   recent_volumes(n), recent_bars(n)     (last n values as a real list)
 # Python slicing works too: list(ctx.closes)[-20:] returns the last 20 closes.
+#
+# Higher timeframes:
+#   htf = ctx.tf('1h')                   # or '5m', '4h', '1d', or seconds
+#   htf.close                            # current forming 1h close
+#   htf.closes[-2]                       # last COMPLETED 1h close
+#   sma(htf.closes, 200)                 # 200-period SMA on 1h
+# The last element of every htf array is the CURRENT (still forming) bar,
+# so [-2] is the most recent completed bar. Aggregation is incremental.
 #   buy(lots, sl=None, tp=None), sell(...), exit()/close_position(), set_sl(px), set_tp(px), log(msg)
 #
 # Also available at module level (no imports needed):
@@ -278,10 +286,27 @@ class BookState {
 
   private curIdx = 0
   private cfg: BacktestConfig
+  // One aggregator per requested higher timeframe. Lazily created — only
+  // pays the cost for timeframes the strategy actually touches. The wrapper
+  // object we return to Python is cached too, so ctx.tf('1h') returns the
+  // same object every call.
+  private tfViews = new Map<number, { view: HigherTfView; ctx: unknown }>()
 
   constructor(cfg: BacktestConfig) {
     this.cfg = cfg
     this.balance = cfg.startingBalance
+  }
+
+  /** Get (or lazily build) the wrapper for `sec`, aggregated up to curIdx. */
+  getTfView(sec: number): unknown {
+    let entry = this.tfViews.get(sec)
+    if (!entry) {
+      const view = new HigherTfView(sec, this.cfg.bars)
+      entry = { view, ctx: buildTfCtx(view) }
+      this.tfViews.set(sec, entry)
+    }
+    entry.view.updateTo(this.curIdx)
+    return entry.ctx
   }
 
   private get curBar(): Bar { return this.cfg.bars[this.curIdx] }
@@ -384,6 +409,12 @@ class BookState {
       recent_lows(n: number)    { return tailField(self.cfg.bars, self.curIdx, n, 'low') },
       recent_closes(n: number)  { return tailField(self.cfg.bars, self.curIdx, n, 'close') },
       recent_volumes(n: number) { return tailField(self.cfg.bars, self.curIdx, n, 'volume') },
+      // Higher-timeframe view. ctx.tf('1h') / ctx.tf('4h') / ctx.tf(300)
+      // returns a mini-ctx with the same OHLC surface (open/high/low/close,
+      // opens/highs/lows/closes/volumes, bars, recent_*) aggregated from the
+      // underlying 1m bars. The last element of every array is the CURRENT
+      // (forming) higher-tf bar, so `htf.closes[-2]` is the last completed one.
+      tf(spec: string | number) { return self.getTfView(parseTfSpec(spec)) },
       get position() {
         if (!self.position) return null
         return {
@@ -501,6 +532,84 @@ function buildBarsProxy(bars: Bar[], getIdx: () => number) {
       return (target as any)[prop]
     },
   }) as unknown as Bar[]
+}
+
+// ─── Higher-timeframe aggregator ────────────────────────────────────────────
+
+/**
+ * Aggregates 1-minute bars into a higher timeframe incrementally as the
+ * replay advances. bars[bars.length - 1] is ALWAYS the "current" (forming)
+ * higher-tf bar — updates in place as more 1m data arrives inside the bucket.
+ * When we cross a bucket boundary the previous bar is finalized (never
+ * mutated again) and a new one is pushed.
+ */
+class HigherTfView {
+  bars: Bar[] = []
+  private lastBaseIdx = -1
+  constructor(private tfSec: number, private baseBars: Bar[]) {}
+
+  updateTo(curBaseIdx: number): void {
+    if (curBaseIdx <= this.lastBaseIdx) return
+    for (let i = this.lastBaseIdx + 1; i <= curBaseIdx; i++) {
+      const b = this.baseBars[i]
+      const bucketStart = Math.floor(b.time / this.tfSec) * this.tfSec
+      const last = this.bars.length ? this.bars[this.bars.length - 1] : null
+      if (last && last.time === bucketStart) {
+        if (b.high > last.high) last.high = b.high
+        if (b.low  < last.low)  last.low  = b.low
+        last.close = b.close
+        last.volume += b.volume
+      } else {
+        this.bars.push({
+          time: bucketStart,
+          open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume,
+        })
+      }
+    }
+    this.lastBaseIdx = curBaseIdx
+  }
+}
+
+/** Same OHLC surface ctx exposes for 1m, but backed by an aggregated view. */
+function buildTfCtx(view: HigherTfView) {
+  const curIdx = () => view.bars.length - 1
+  const curBar = () => view.bars[curIdx()]
+  return {
+    get time()   { return curBar()?.time   ?? 0 },
+    get open()   { return curBar()?.open   ?? 0 },
+    get high()   { return curBar()?.high   ?? 0 },
+    get low()    { return curBar()?.low    ?? 0 },
+    get close()  { return curBar()?.close  ?? 0 },
+    get volume() { return curBar()?.volume ?? 0 },
+    opens:   buildFieldProxy(view.bars, 'open',   curIdx),
+    highs:   buildFieldProxy(view.bars, 'high',   curIdx),
+    lows:    buildFieldProxy(view.bars, 'low',    curIdx),
+    closes:  buildFieldProxy(view.bars, 'close',  curIdx),
+    volumes: buildFieldProxy(view.bars, 'volume', curIdx),
+    bars:    buildBarsProxy(view.bars, curIdx),
+    recent_bars(n: number)    { return tailBars(view.bars, curIdx(), n) },
+    recent_opens(n: number)   { return tailField(view.bars, curIdx(), n, 'open') },
+    recent_highs(n: number)   { return tailField(view.bars, curIdx(), n, 'high') },
+    recent_lows(n: number)    { return tailField(view.bars, curIdx(), n, 'low') },
+    recent_closes(n: number)  { return tailField(view.bars, curIdx(), n, 'close') },
+    recent_volumes(n: number) { return tailField(view.bars, curIdx(), n, 'volume') },
+  }
+}
+
+/** '1m' / '5m' / '15m' / '30m' / '1h' / '4h' / '1d' / '1w' — or seconds as a number. */
+function parseTfSpec(spec: string | number): number {
+  if (typeof spec === 'number') {
+    const n = Math.floor(spec)
+    if (n < 60) throw new Error(`Timeframe too short: ${spec}s (min 60s)`)
+    return n
+  }
+  const m = String(spec).trim().toLowerCase().match(/^(\d+)\s*(m|h|d|w)$/)
+  if (!m) throw new Error(`Bad timeframe "${spec}" — use '5m', '15m', '1h', '4h', '1d', or seconds`)
+  const n = Number(m[1])
+  const mult = m[2] === 'm' ? 60 : m[2] === 'h' ? 3600 : m[2] === 'd' ? 86400 : 604800
+  const sec = n * mult
+  if (sec < 60) throw new Error(`Timeframe too short: ${spec}`)
+  return sec
 }
 
 /** Last-N helpers. Return real arrays so Python slicing on the result works too. */
