@@ -28,10 +28,22 @@ export interface CustomIndicatorDef {
   updatedAt: number
 }
 
+export interface StrategyFile {
+  name: string           // e.g. 'main.py', 'utils.py'. .py extension enforced by UI.
+  content: string
+}
+
 export interface StrategyDef {
   id?: number
   name: string
-  code: string           // Python source — see src/strategy/runner.ts contract
+  /**
+   * Deprecated single-file field, kept for backward compat with pre-1.8 records.
+   * Use getStrategyFiles(def) — it migrates on read so the rest of the app only
+   * sees the multi-file shape.
+   */
+  code?: string
+  files?: StrategyFile[] // primary storage from v1.8 onward
+  mainFile?: string      // name of the entry point; defaults to 'main.py'
   symbol: string         // default instrument to backtest against
   from?: number          // epoch seconds, inclusive; undefined = all available data
   to?: number
@@ -40,6 +52,19 @@ export interface StrategyDef {
   startingBalance: number
   createdAt: number
   updatedAt: number
+}
+
+/** Read shape: always returns non-empty files[] + a mainFile that exists in it. */
+export function getStrategyFiles(def: StrategyDef): { files: StrategyFile[]; mainFile: string } {
+  const raw = def.files && def.files.length ? def.files.slice() : []
+  if (!raw.length) {
+    raw.push({ name: 'main.py', content: def.code ?? '' })
+  }
+  const explicitMain = def.mainFile && raw.some(f => f.name === def.mainFile) ? def.mainFile : undefined
+  const mainFile = explicitMain
+    ?? (raw.find(f => f.name === 'main.py')?.name)
+    ?? raw[0].name
+  return { files: raw, mainFile }
 }
 
 class TradingJournalDB extends Dexie {

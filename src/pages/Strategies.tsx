@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { Bar as BarChart, Bar as RCBar, BarChart as RCBarChart, CartesianGrid, Cell, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import Editor, { type OnMount } from '@monaco-editor/react'
-import { db, getSetting, setSetting, type StrategyDef } from '../db'
+import { db, getSetting, setSetting, getStrategyFiles, type StrategyDef, type StrategyFile } from '../db'
 import { getBars, chunksFor } from '../data/dataService'
 import { fmtDate, fmtUsd, fmtR, fmtDateTime, fmtPct, fmtDuration } from '../lib/gold'
 import { useSymbolList } from '../lib/instruments'
@@ -32,6 +32,23 @@ const TOOLTIP = {
   itemStyle: { color: '#ffffff' },
 }
 
+/** Monaco options shared between the inline editor and the expanded overlay. */
+const monacoOptions = {
+  minimap: { enabled: false },
+  fontSize: 13,
+  fontFamily: 'ui-monospace, SFMono-Regular, Consolas, Menlo, monospace',
+  tabSize: 4,
+  insertSpaces: true,
+  renderLineHighlight: 'gutter' as const,
+  scrollBeyondLastLine: false,
+  smoothScrolling: true,
+  wordWrap: 'off' as const,
+  automaticLayout: true,
+  padding: { top: 8, bottom: 8 },
+  lineNumbersMinChars: 3,
+  overviewRulerBorder: false,
+}
+
 // Suppress a false-positive: recharts imports `Bar` twice above for clarity.
 void BarChart; void RCBar
 
@@ -40,6 +57,8 @@ export default function Strategies() {
   const symbols = useSymbolList()
   const [activeId, setActiveId] = useState<number | null>(null)
   const [draft, setDraft] = useState<StrategyDef | null>(null)
+  const [activeFile, setActiveFile] = useState<string>('main.py')
+  const [expanded, setExpanded] = useState(false)
   const [pyStatus, setPyStatus] = useState<LoadStatus>(pyodideStatus())
   const [progress, setProgress] = useState<RunProgress | null>(null)
   const [running, setRunning] = useState(false)
@@ -54,10 +73,16 @@ export default function Strategies() {
 
   const active = strategies.find(s => s.id === activeId) ?? null
 
-  // Bring editor into sync whenever the active strategy changes.
+  // Bring editor into sync whenever the active strategy changes. We normalize
+  // the multi-file shape here so downstream code only sees files[] + mainFile.
   useEffect(() => {
-    if (active) setDraft({ ...active })
-    else setDraft(null)
+    if (active) {
+      const { files, mainFile } = getStrategyFiles(active)
+      setDraft({ ...active, files, mainFile })
+      setActiveFile(mainFile)
+    } else {
+      setDraft(null)
+    }
     setResult(null)
   }, [active?.id])
 
@@ -74,20 +99,27 @@ export default function Strategies() {
   }, [])
   useEffect(() => { void setSetting('strategyAutoFix', autoFixOn) }, [autoFixOn])
 
-  // Debounced live lint. Fires 400ms after typing stops. Warms pyodide the
-  // first time (~10 MB download) — same runtime the backtest uses.
+  // Debounced live lint on the active file. Fires 400ms after typing stops.
+  // Warms pyodide the first time (~10 MB download).
+  const activeContent = useMemo(() => {
+    if (!draft?.files) return ''
+    return draft.files.find(f => f.name === activeFile)?.content ?? ''
+  }, [draft?.files, activeFile])
+
   useEffect(() => {
     if (!draft) { setIssues([]); return }
-    const code = draft.code
+    const code = activeContent
     const handle = window.setTimeout(async () => {
       const found = await lintPython(code)
-      setIssues(found)
-      // Push markers into Monaco so squiggles appear inline.
+      // Only reject the on_bar warning if this isn't the main file.
+      const isMain = activeFile === (draft.mainFile ?? 'main.py')
+      const filtered = isMain ? found : found.filter(f => !/on_bar\(ctx\)/.test(f.message))
+      setIssues(filtered)
       const editor = editorRef.current, monaco = monacoRef.current
       if (editor && monaco) {
         const model = editor.getModel()
         if (model) {
-          monaco.editor.setModelMarkers(model, 'py-lint', found.map(iss => ({
+          monaco.editor.setModelMarkers(model, 'py-lint', filtered.map(iss => ({
             severity: iss.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
             message: iss.message,
             startLineNumber: iss.line,
@@ -99,7 +131,7 @@ export default function Strategies() {
       }
     }, 400)
     return () => window.clearTimeout(handle)
-  }, [draft?.code, draft?.id])
+  }, [activeContent, activeFile, draft?.id, draft?.mainFile])
 
   const startNew = () => {
     const now = Date.now()
@@ -107,7 +139,8 @@ export default function Strategies() {
     setActiveId(null)
     setDraft({
       name: 'New strategy',
-      code: seed.code,
+      files: [{ name: 'main.py', content: seed.code }],
+      mainFile: 'main.py',
       symbol: symbols[0] ?? 'XAUUSD',
       spread: 0.3,
       commissionPerLot: 6,
@@ -115,18 +148,26 @@ export default function Strategies() {
       createdAt: now,
       updatedAt: now,
     })
+    setActiveFile('main.py')
     setResult(null)
   }
 
   const save = async () => {
     if (!draft) return
-    // Apply auto-fix silently on save if the toggle is on. Only the whitespace
-    // is touched — semantics stay identical (see autoFix() docstring).
-    const nextCode = autoFixOn ? autoFix(draft.code) : draft.code
-    const rec = { ...draft, code: nextCode, updatedAt: Date.now() }
-    if (nextCode !== draft.code) setDraft({ ...draft, code: nextCode })
+    // Apply auto-fix silently on save to every file (semantics unchanged — see
+    // autoFix() docstring). Sync so the editor reflects the cleaned version.
+    const files = draft.files ?? []
+    const nextFiles = autoFixOn ? files.map(f => ({ ...f, content: autoFix(f.content) })) : files
+    const rec: StrategyDef = { ...draft, files: nextFiles, updatedAt: Date.now() }
+    // Keep `code` in sync with main file for backward compat if the record ever
+    // gets read by an older build.
+    const main = nextFiles.find(f => f.name === (draft.mainFile ?? 'main.py'))
+    if (main) rec.code = main.content
+    if (nextFiles !== files) setDraft(rec)
     if (rec.id !== undefined) {
-      await db.strategies.update(rec.id, rec)
+      // put() replaces the whole record; update() would want a partial spec
+      // that TS can't infer through the files array shape.
+      await db.strategies.put(rec)
     } else {
       const id = await db.strategies.add({ ...rec, createdAt: Date.now() })
       setActiveId(id as number)
@@ -135,7 +176,58 @@ export default function Strategies() {
 
   const formatNow = () => {
     if (!draft) return
-    setDraft({ ...draft, code: autoFix(draft.code) })
+    const files = (draft.files ?? []).map(f =>
+      f.name === activeFile ? { ...f, content: autoFix(f.content) } : f,
+    )
+    setDraft({ ...draft, files })
+  }
+
+  // File tab actions.
+  const setActiveFileContent = (content: string) => {
+    if (!draft) return
+    const files = (draft.files ?? []).map(f => f.name === activeFile ? { ...f, content } : f)
+    setDraft({ ...draft, files })
+  }
+  const addFile = () => {
+    if (!draft) return
+    const files = draft.files ?? []
+    // Pick a unique default name.
+    let n = 1, name = `lib${n}.py`
+    while (files.some(f => f.name === name)) { n++; name = `lib${n}.py` }
+    setDraft({ ...draft, files: [...files, { name, content: '# New module — imported from main.py as `import ' + name.slice(0, -3) + '`\n' }] })
+    setActiveFile(name)
+  }
+  const renameFile = (oldName: string) => {
+    if (!draft) return
+    const raw = prompt('Rename file', oldName)
+    if (raw == null) return
+    const clean = raw.trim()
+    if (!clean) return
+    const withExt = clean.endsWith('.py') ? clean : `${clean}.py`
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*\.py$/.test(withExt)) {
+      alert('Name must be letters/digits/underscore, start with a letter, and end in .py')
+      return
+    }
+    const files = draft.files ?? []
+    if (files.some(f => f.name === withExt)) { alert(`${withExt} already exists`); return }
+    const nextFiles = files.map(f => f.name === oldName ? { ...f, name: withExt } : f)
+    const nextMain = draft.mainFile === oldName ? withExt : draft.mainFile
+    setDraft({ ...draft, files: nextFiles, mainFile: nextMain })
+    if (activeFile === oldName) setActiveFile(withExt)
+  }
+  const deleteFile = (name: string) => {
+    if (!draft) return
+    const files = draft.files ?? []
+    if (files.length <= 1) { alert('At least one file is required.'); return }
+    if (name === (draft.mainFile ?? 'main.py')) { alert('Set another file as main first, then delete this one.'); return }
+    if (!confirm(`Delete ${name}? This can't be undone.`)) return
+    const nextFiles = files.filter(f => f.name !== name)
+    setDraft({ ...draft, files: nextFiles })
+    if (activeFile === name) setActiveFile(nextFiles[0].name)
+  }
+  const setAsMain = (name: string) => {
+    if (!draft) return
+    setDraft({ ...draft, mainFile: name })
   }
 
   const onEditorMount: OnMount = useCallback((editor, monaco) => {
@@ -170,6 +262,7 @@ export default function Strategies() {
       // Kick off pyodide load so its status flows to the UI even before runBacktest awaits it.
       void loadPyodideRuntime()
 
+      const { files, mainFile } = getStrategyFiles(draft)
       const r = await runBacktest(
         {
           symbol: draft.symbol,
@@ -178,7 +271,8 @@ export default function Strategies() {
           commissionPerLot: draft.commissionPerLot,
           startingBalance: draft.startingBalance,
         },
-        draft.code,
+        files,
+        mainFile,
         p => setProgress(p),
       )
       setResult(r)
@@ -283,54 +377,45 @@ export default function Strategies() {
               </div>
 
               <div className="flex-1 min-h-0 grid grid-rows-[minmax(180px,1fr)_auto_minmax(200px,2fr)]">
-                {/* Code editor (Monaco — same one VS Code uses) */}
+                {/* Code editor (Monaco — same one VS Code uses) with per-file tabs */}
                 <div className="border-b border-hairline flex flex-col min-h-0">
-                  <div className="flex items-center gap-2 px-3 py-1 text-[11px] text-muted flex-wrap">
-                    <span>Python — <span className="text-ink2">def on_bar(ctx): …</span></span>
-                    <span className="mx-1 opacity-40">·</span>
-                    <span>Load example:</span>
-                    {STRATEGY_EXAMPLES.map((e, i) => (
-                      <button key={i} className="btn-ghost !text-[11px] !py-0 !px-1.5"
-                        onClick={() => setDraft(d => d && { ...d, code: e.code })}
-                        title={e.description}
-                      >{e.name}</button>
-                    ))}
-                    <div className="flex-1" />
-                    <label className="flex items-center gap-1 text-[11px] text-ink2 cursor-pointer" title="When on, saves silently strip trailing whitespace, expand leading tabs to 4 spaces, and ensure a final newline. Semantics never change.">
-                      <input type="checkbox" className="accent-[#3987e5]" checked={autoFixOn} onChange={e => setAutoFixOn(e.target.checked)} />
-                      Auto-fix on save
-                    </label>
-                    <button className="btn-ghost !text-[11px] !py-0 !px-1.5" onClick={formatNow} title="Format now — same rules Auto-fix applies on save">Format</button>
-                  </div>
+                  <FileTabBar
+                    files={draft.files ?? []}
+                    activeFile={activeFile}
+                    mainFile={draft.mainFile ?? 'main.py'}
+                    onSelect={setActiveFile}
+                    onAdd={addFile}
+                    onRename={renameFile}
+                    onDelete={deleteFile}
+                    onSetMain={setAsMain}
+                    autoFixOn={autoFixOn}
+                    setAutoFixOn={setAutoFixOn}
+                    formatNow={formatNow}
+                    onExpandToggle={() => setExpanded(v => !v)}
+                    expanded={false}
+                    examples={STRATEGY_EXAMPLES}
+                    onLoadExample={code => {
+                      const files = (draft.files ?? []).map(f =>
+                        f.name === activeFile ? { ...f, content: code } : f,
+                      )
+                      setDraft({ ...draft, files })
+                    }}
+                  />
                   <div className="flex-1 min-h-0 border-t border-hairline">
                     <Editor
-                      value={draft.code}
-                      onChange={v => setDraft(d => d && { ...d, code: v ?? '' })}
+                      value={activeContent}
+                      onChange={v => setActiveFileContent(v ?? '')}
                       language="python"
                       theme="vs-dark"
                       onMount={onEditorMount}
-                      options={{
-                        minimap: { enabled: false },
-                        fontSize: 12.5,
-                        fontFamily: 'ui-monospace, SFMono-Regular, Consolas, Menlo, monospace',
-                        tabSize: 4,
-                        insertSpaces: true,
-                        renderLineHighlight: 'gutter',
-                        scrollBeyondLastLine: false,
-                        smoothScrolling: true,
-                        wordWrap: 'off',
-                        automaticLayout: true,
-                        padding: { top: 8, bottom: 8 },
-                        lineNumbersMinChars: 3,
-                        overviewRulerBorder: false,
-                        // Keep the built-in Python language service; our lint layer feeds
-                        // markers separately via setModelMarkers so syntax errors show
-                        // with the same red squiggles you'd get in VS Code.
-                      }}
+                      options={monacoOptions}
                       loading={<div className="p-3 text-xs text-muted">Loading editor…</div>}
+                      // Force a fresh model per file so Monaco tracks per-file
+                      // undo history + lint markers correctly.
+                      path={activeFile}
                     />
                   </div>
-                  <ProblemsStrip issues={issues} />
+                  <ProblemsStrip issues={issues} activeFile={activeFile} />
                 </div>
 
                 {/* Progress / Pyodide status */}
@@ -347,6 +432,119 @@ export default function Strategies() {
           )}
         </section>
       </div>
+
+      {/* Fullscreen editor overlay — same tab bar and Monaco, filling the window.
+          Config / results / sidebar all stay hidden until Restore. */}
+      {expanded && draft && (
+        <ExpandedEditor
+          draft={draft}
+          activeFile={activeFile}
+          activeContent={activeContent}
+          issues={issues}
+          autoFixOn={autoFixOn}
+          setAutoFixOn={setAutoFixOn}
+          formatNow={formatNow}
+          examples={STRATEGY_EXAMPLES}
+          onLoadExample={code => {
+            const files = (draft.files ?? []).map(f =>
+              f.name === activeFile ? { ...f, content: code } : f,
+            )
+            setDraft({ ...draft, files })
+          }}
+          onSelectFile={setActiveFile}
+          onAddFile={addFile}
+          onRenameFile={renameFile}
+          onDeleteFile={deleteFile}
+          onSetMain={setAsMain}
+          onEdit={setActiveFileContent}
+          onMount={onEditorMount}
+          onSave={save}
+          onRun={run}
+          running={running}
+          onClose={() => setExpanded(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+interface ExpandedEditorProps {
+  draft: StrategyDef
+  activeFile: string
+  activeContent: string
+  issues: LintIssue[]
+  autoFixOn: boolean
+  setAutoFixOn: (v: boolean) => void
+  formatNow: () => void
+  examples: { name: string; code: string; description: string }[]
+  onLoadExample: (code: string) => void
+  onSelectFile: (name: string) => void
+  onAddFile: () => void
+  onRenameFile: (name: string) => void
+  onDeleteFile: (name: string) => void
+  onSetMain: (name: string) => void
+  onEdit: (content: string) => void
+  onMount: OnMount
+  onSave: () => void | Promise<void>
+  onRun: () => void | Promise<void>
+  running: boolean
+  onClose: () => void
+}
+
+function ExpandedEditor(p: ExpandedEditorProps) {
+  // Esc restores the normal layout. Wire once at the overlay's mount so it
+  // doesn't leak listeners when collapsed.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.preventDefault(); p.onClose() }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [p.onClose])
+
+  return (
+    <div className="fixed inset-0 z-40 bg-surface flex flex-col">
+      {/* Compact top strip: strategy name, save/run, restore. */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-hairline bg-surface text-sm">
+        <span className="text-ink font-semibold">{p.draft.name}</span>
+        <span className="text-[11px] text-muted">— editing {p.activeFile}</span>
+        <div className="flex-1" />
+        <button className="btn-ghost text-xs" onClick={p.onSave}>Save</button>
+        {p.running
+          ? <button className="btn-ghost text-xs" disabled>Running…</button>
+          : <button className="btn-primary text-xs" onClick={p.onRun}>▶ Run</button>}
+        <button className="btn-ghost text-xs" onClick={p.onClose} title="Restore normal layout (Esc)">⤡ Restore</button>
+      </div>
+      <FileTabBar
+        files={p.draft.files ?? []}
+        activeFile={p.activeFile}
+        mainFile={p.draft.mainFile ?? 'main.py'}
+        onSelect={p.onSelectFile}
+        onAdd={p.onAddFile}
+        onRename={p.onRenameFile}
+        onDelete={p.onDeleteFile}
+        onSetMain={p.onSetMain}
+        autoFixOn={p.autoFixOn}
+        setAutoFixOn={p.setAutoFixOn}
+        formatNow={p.formatNow}
+        onExpandToggle={p.onClose}
+        expanded
+        examples={p.examples}
+        onLoadExample={p.onLoadExample}
+      />
+      <div className="flex-1 min-h-0 border-t border-hairline">
+        <Editor
+          value={p.activeContent}
+          onChange={v => p.onEdit(v ?? '')}
+          language="python"
+          theme="vs-dark"
+          onMount={p.onMount}
+          options={monacoOptions}
+          path={p.activeFile}
+          loading={<div className="p-3 text-xs text-muted">Loading editor…</div>}
+        />
+      </div>
+      <ProblemsStrip issues={p.issues} activeFile={p.activeFile} />
     </div>
   )
 }
@@ -529,11 +727,11 @@ function MiniStat({ label, value, sub }: { label: string; value: React.ReactNode
   )
 }
 
-function ProblemsStrip({ issues }: { issues: LintIssue[] }) {
+function ProblemsStrip({ issues, activeFile }: { issues: LintIssue[]; activeFile?: string }) {
   if (issues.length === 0) {
     return (
       <div className="px-3 py-1 text-[11px] text-up border-t border-hairline bg-black/20 flex items-center gap-2">
-        <span className="inline-block w-1.5 h-1.5 rounded-full bg-up" /> No problems.
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-up" /> No problems{activeFile ? ` in ${activeFile}` : ''}.
       </div>
     )
   }
@@ -543,11 +741,101 @@ function ProblemsStrip({ issues }: { issues: LintIssue[] }) {
         <div key={i} className="flex items-baseline gap-2 px-3 py-1 text-[11px]">
           <span className={`inline-block w-1.5 h-1.5 rounded-full ${iss.severity === 'error' ? 'bg-down' : 'bg-warn'}`} />
           <span className={iss.severity === 'error' ? 'text-down' : 'text-warn'}>{iss.severity}</span>
+          {activeFile && <span className="text-muted">{activeFile}</span>}
           <span className="text-muted">line {iss.line}:{iss.column}</span>
           <span className="text-ink2">{iss.message}</span>
         </div>
       ))}
     </div>
+  )
+}
+
+/** Tabbed file-name bar above the editor. Handles rename / delete / add /
+ * set-main plus the auto-fix/format/expand controls. Kept as a plain function
+ * component so both the inline editor and the fullscreen overlay can render it. */
+function FileTabBar({
+  files, activeFile, mainFile, onSelect, onAdd, onRename, onDelete, onSetMain,
+  autoFixOn, setAutoFixOn, formatNow, onExpandToggle, expanded, examples, onLoadExample,
+}: {
+  files: StrategyFile[]
+  activeFile: string
+  mainFile: string
+  onSelect: (name: string) => void
+  onAdd: () => void
+  onRename: (name: string) => void
+  onDelete: (name: string) => void
+  onSetMain: (name: string) => void
+  autoFixOn: boolean
+  setAutoFixOn: (v: boolean) => void
+  formatNow: () => void
+  onExpandToggle: () => void
+  expanded: boolean
+  examples: { name: string; code: string; description: string }[]
+  onLoadExample: (code: string) => void
+}) {
+  return (
+    <>
+      {/* File tabs — main gets a star, others get delete on hover. */}
+      <div className="flex items-center gap-0.5 px-2 pt-1 bg-black/20 overflow-x-auto flex-shrink-0">
+        {files.map(f => {
+          const isActive = f.name === activeFile
+          const isMain = f.name === mainFile
+          return (
+            <div
+              key={f.name}
+              className={`group flex items-center gap-1 pl-2 pr-1 py-1 text-[11px] rounded-t cursor-pointer border-t border-x border-hairline shrink-0 ${
+                isActive ? 'bg-surface text-ink' : 'bg-transparent text-ink2 hover:bg-white/5 border-transparent'
+              }`}
+              onClick={() => onSelect(f.name)}
+              onDoubleClick={e => { e.stopPropagation(); onRename(f.name) }}
+              title={isMain ? 'Main entry point — cannot be deleted' : 'Double-click to rename'}
+            >
+              {isMain && <span className="text-warn">★</span>}
+              <span>{f.name}</span>
+              {!isMain && files.length > 1 && (
+                <button
+                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-down text-sm px-1 leading-none"
+                  title="Delete file"
+                  onClick={e => { e.stopPropagation(); onDelete(f.name) }}
+                >×</button>
+              )}
+              {!isMain && (
+                <button
+                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-warn text-xs px-1 leading-none"
+                  title="Set as main"
+                  onClick={e => { e.stopPropagation(); onSetMain(f.name) }}
+                >☆</button>
+              )}
+            </div>
+          )
+        })}
+        <button
+          className="ml-1 text-muted hover:text-ink text-xs px-2 py-1"
+          title="Add a new .py file"
+          onClick={onAdd}
+        >+</button>
+      </div>
+
+      {/* Utility row: examples · auto-fix · format · expand */}
+      <div className="flex items-center gap-2 px-3 py-1 text-[11px] text-muted flex-wrap flex-shrink-0">
+        <span>Load into {activeFile}:</span>
+        {examples.map((e, i) => (
+          <button key={i} className="btn-ghost !text-[11px] !py-0 !px-1.5"
+            onClick={() => onLoadExample(e.code)}
+            title={e.description}
+          >{e.name}</button>
+        ))}
+        <div className="flex-1" />
+        <label className="flex items-center gap-1 text-[11px] text-ink2 cursor-pointer" title="When on, saves silently strip trailing whitespace, expand leading tabs to 4 spaces, and ensure a final newline. Semantics never change.">
+          <input type="checkbox" className="accent-[#3987e5]" checked={autoFixOn} onChange={e => setAutoFixOn(e.target.checked)} />
+          Auto-fix on save
+        </label>
+        <button className="btn-ghost !text-[11px] !py-0 !px-1.5" onClick={formatNow} title="Format the current file — same rules Auto-fix applies on save">Format</button>
+        <button className="btn-ghost !text-[11px] !py-0 !px-1.5" onClick={onExpandToggle} title={expanded ? 'Restore normal layout (Esc)' : 'Expand editor to fill the window'}>
+          {expanded ? '⤡ Restore' : '⛶ Expand'}
+        </button>
+      </div>
+    </>
   )
 }
 

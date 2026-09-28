@@ -20,9 +20,10 @@
 // line up with what you'd see stepping through the interactive backtester.
 
 import type { Bar, Trade, Direction, ExitReason } from '../lib/types'
+import type { StrategyFile } from '../db'
 import { pnlUsd, riskUsd } from '../lib/gold'
 import { specFor } from '../lib/symbols'
-import { loadPyodideRuntime } from './pyodide'
+import { loadPyodideRuntime, type PyodideRuntime } from './pyodide'
 
 export interface BacktestConfig {
   symbol: string
@@ -31,6 +32,9 @@ export interface BacktestConfig {
   commissionPerLot: number // round-turn, per lot
   startingBalance: number
 }
+
+/** Where user files land in Pyodide's virtual FS. */
+const STRATEGY_DIR = '/tmp/strategy'
 
 export interface BacktestPosition {
   direction: Direction
@@ -98,7 +102,8 @@ export interface RunProgress {
 
 export async function runBacktest(
   cfg: BacktestConfig,
-  userCode: string,
+  files: StrategyFile[],
+  mainFile: string,
   onProgress?: (p: RunProgress) => void,
 ): Promise<BacktestResult> {
   const t0 = performance.now()
@@ -106,17 +111,21 @@ export async function runBacktest(
 
   const py = await loadPyodideRuntime()
 
-  // Compile the user code into the runtime's globals. We wrap it so we can
-  // fail fast if `on_bar` isn't defined instead of tolerating a silent no-op.
+  // Mount every file to the pyodide FS so `import mylib` inside main.py finds
+  // sibling modules. Then execute the main file so its top-level `on_bar` lands
+  // in the runtime's globals.
   try {
-    py.runPython(`${CONTRACT_HEADER}\n${userCode}`)
+    mountStrategyFiles(py, files)
+    const main = files.find(f => f.name === mainFile) ?? files[0]
+    if (!main) throw new Error('No files in strategy')
+    py.runPython(`${CONTRACT_HEADER}\n${main.content}`)
   } catch (e: any) {
     return baseError(`Compile error: ${e?.message ?? e}`, t0, cfg)
   }
 
   const on_bar = py.globals.get('on_bar')
   if (!on_bar || typeof on_bar.callKwargs !== 'function' && typeof on_bar !== 'function') {
-    return baseError('Your code did not define an on_bar(ctx) function.', t0, cfg)
+    return baseError(`Your ${mainFile} did not define an on_bar(ctx) function.`, t0, cfg)
   }
 
   const state = new BookState(cfg)
@@ -159,6 +168,49 @@ export async function runBacktest(
     error,
     runtimeSeconds: (performance.now() - t0) / 1000,
   }
+}
+
+/**
+ * Write every user file to Pyodide's virtual FS at STRATEGY_DIR, add that dir
+ * to sys.path, and purge any previously-imported user modules so a re-run picks
+ * up code edits.
+ */
+function mountStrategyFiles(py: PyodideRuntime, files: StrategyFile[]): void {
+  // FS access is exposed on the runtime as a top-level `FS` property. The
+  // Pyodide types don't advertise it, but it's the documented public API.
+  const FS = (py as unknown as { FS: any }).FS
+  try { FS.mkdirTree(STRATEGY_DIR) } catch { /* already exists */ }
+  // Wipe previous files so a renamed/deleted module doesn't linger.
+  try {
+    for (const entry of FS.readdir(STRATEGY_DIR) as string[]) {
+      if (entry === '.' || entry === '..') continue
+      try { FS.unlink(`${STRATEGY_DIR}/${entry}`) } catch { /* skip */ }
+    }
+  } catch { /* directory didn't exist */ }
+
+  const moduleNames: string[] = []
+  for (const f of files) {
+    // Guard against filename shenanigans — no slashes, must end in .py, must
+    // be a plain identifier stem. Enforced by the UI too but check in depth.
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*\.py$/.test(f.name)) {
+      throw new Error(`Invalid file name "${f.name}" — use letters/digits/underscore + .py`)
+    }
+    FS.writeFile(`${STRATEGY_DIR}/${f.name}`, f.content, { encoding: 'utf8' })
+    moduleNames.push(f.name.slice(0, -3))
+  }
+
+  // Add STRATEGY_DIR to sys.path (once) and drop any stale module entries so
+  // `import` re-reads from disk. Escape the module names for the Python literal.
+  const stalePyList = '[' + moduleNames.map(n => `"${n}"`).join(',') + ']'
+  py.runPython(
+`import sys
+_p = "${STRATEGY_DIR}"
+if _p not in sys.path:
+    sys.path.insert(0, _p)
+for _m in ${stalePyList}:
+    sys.modules.pop(_m, None)
+`,
+  )
 }
 
 function baseError(msg: string, t0: number, cfg: BacktestConfig): BacktestResult {
