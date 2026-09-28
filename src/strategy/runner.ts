@@ -24,6 +24,7 @@ import type { StrategyFile } from '../db'
 import { pnlUsd, riskUsd } from '../lib/gold'
 import { specFor } from '../lib/symbols'
 import { loadPyodideRuntime, type PyodideRuntime } from './pyodide'
+import { TA_MODULE_SOURCE } from './ta'
 
 export interface BacktestConfig {
   symbol: string
@@ -35,6 +36,8 @@ export interface BacktestConfig {
 
 /** Where user files land in Pyodide's virtual FS. */
 const STRATEGY_DIR = '/tmp/strategy'
+/** Bundled helpers — a separate directory so it survives strategy-file wipes. */
+const BUILTIN_LIB_DIR = '/tj_lib'
 
 export interface BacktestPosition {
   direction: Direction
@@ -90,9 +93,35 @@ export function dowBreakdown(trades: BacktestTrade[]): DowStat[] {
 const CONTRACT_HEADER =
 `# Backtest runner injects these globals before your code runs:
 #   on_bar(ctx) — implement this
-# ctx exposes: now, price, ask, bid, spread, position, buy(), sell(), close(), log(), balance
-# See EXAMPLES in the editor for reference implementations.
+# ctx exposes:
+#   now, price, ask, bid, spread, balance, position
+#   open, high, low, close, volume        (current bar)
+#   opens, highs, lows, closes, volumes   (arrays up to current bar)
+#   bars                                  (list of dicts, one per bar)
+#   buy(lots, sl=None, tp=None), sell(...), exit()/close_position(), set_sl(px), set_tp(px), log(msg)
+#
+# Also available at module level (no imports needed):
+#   sma, ema, rma, wma, stdev, highest, lowest, change,
+#   rsi, macd, bbands, atr, vwap, roc, momentum,
+#   cross_up, cross_down, is_finite, nan
+# Or use them via the 'ta' module: ta.sma(closes, 20), ta.rsi(closes)
 `
+
+/** Runs once on the first backtest of an app session. Idempotent. */
+let builtinLibInstalled = false
+function installBuiltinLib(py: PyodideRuntime): void {
+  if (builtinLibInstalled) return
+  const FS = (py as unknown as { FS: any }).FS
+  try { FS.mkdirTree(BUILTIN_LIB_DIR) } catch { /* exists */ }
+  FS.writeFile(`${BUILTIN_LIB_DIR}/ta.py`, TA_MODULE_SOURCE, { encoding: 'utf8' })
+  py.runPython(
+`import sys
+if "${BUILTIN_LIB_DIR}" not in sys.path:
+    sys.path.insert(0, "${BUILTIN_LIB_DIR}")
+`,
+  )
+  builtinLibInstalled = true
+}
 
 export interface RunProgress {
   processed: number
@@ -111,13 +140,28 @@ export async function runBacktest(
 
   const py = await loadPyodideRuntime()
 
-  // Mount every file to the pyodide FS so `import mylib` inside main.py finds
-  // sibling modules. Then execute the main file so its top-level `on_bar` lands
-  // in the runtime's globals.
+  // Bundled helper library — written to a separate FS dir that survives
+  // strategy-file wipes. Idempotent, so cheap to call every run.
+  installBuiltinLib(py)
+
+  // Mount every user file to the pyodide FS so `import mylib` inside main.py
+  // finds sibling modules. Then flatten ta helpers into the module globals
+  // and execute the main file so its top-level `on_bar` lands in the runtime's
+  // globals too.
   try {
     mountStrategyFiles(py, files)
     const main = files.find(f => f.name === mainFile) ?? files[0]
     if (!main) throw new Error('No files in strategy')
+    py.runPython(
+`import ta
+from ta import (
+    sma, ema, rma, wma, stdev, highest, lowest, change,
+    rsi, macd, bbands, atr, vwap, roc, momentum,
+    cross_up, cross_down, is_finite,
+)
+from math import nan
+`,
+    )
     py.runPython(`${CONTRACT_HEADER}\n${main.content}`)
   } catch (e: any) {
     return baseError(`Compile error: ${e?.message ?? e}`, t0, cfg)
@@ -315,6 +359,19 @@ class BookState {
       get ask() { return self.ask },
       get spread() { return self.cfg.spread },
       get balance() { return self.balance },
+      // Current-bar OHLC shortcuts — the most common thing you need.
+      get open()   { return self.curBar.open },
+      get high()   { return self.curBar.high },
+      get low()    { return self.curBar.low },
+      get close()  { return self.curBar.close },
+      get volume() { return self.curBar.volume },
+      // OHLC as arrays up to (and including) the current bar. Backed by a
+      // Proxy so we don't materialize the full array every tick.
+      opens:   buildFieldProxy(self.cfg.bars, 'open',   () => self.curIdx),
+      highs:   buildFieldProxy(self.cfg.bars, 'high',   () => self.curIdx),
+      lows:    buildFieldProxy(self.cfg.bars, 'low',    () => self.curIdx),
+      closes:  buildFieldProxy(self.cfg.bars, 'close',  () => self.curIdx),
+      volumes: buildFieldProxy(self.cfg.bars, 'volume', () => self.curIdx),
       get position() {
         if (!self.position) return null
         return {
@@ -353,7 +410,15 @@ class BookState {
         }
         return true
       },
-      close() {
+      // Position close. ctx.close is now the current bar's close price, so the
+      // action lives under ctx.exit() / ctx.close_position(). Both are aliases.
+      exit() {
+        if (!self.position) return false
+        const exit = self.position.direction === 'long' ? self.bid : self.ask
+        self.fillExit(exit, 'manual')
+        return true
+      },
+      close_position() {
         if (!self.position) return false
         const exit = self.position.direction === 'long' ? self.bid : self.ask
         self.fillExit(exit, 'manual')
@@ -370,6 +435,27 @@ class BookState {
       bars: buildBarsProxy(self.cfg.bars, () => self.curIdx),
     }
   }
+}
+
+/**
+ * Python-facing single-field accessor. `ctx.closes[-1]` returns the current
+ * bar's close as a number. Length caps at curIdx + 1 so `sma(ctx.closes, 20)`
+ * never peeks at future bars by accident.
+ */
+function buildFieldProxy<K extends keyof Bar>(bars: Bar[], key: K, getIdx: () => number): number[] {
+  return new Proxy(bars, {
+    get(target, prop) {
+      const idx = getIdx()
+      if (prop === 'length') return idx + 1
+      if (typeof prop === 'string' && /^-?\d+$/.test(prop)) {
+        let i = Number(prop)
+        if (i < 0) i = idx + 1 + i
+        if (i < 0 || i > idx) return undefined
+        return target[i][key] as number
+      }
+      return (target as any)[prop]
+    },
+  }) as unknown as number[]
 }
 
 /** Python-facing bars accessor. `ctx.bars[-1]` returns current bar dict. */
