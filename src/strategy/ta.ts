@@ -23,6 +23,27 @@ the input bars, so result[-1] is always the current bar's value.
 
 from math import nan, isfinite, sqrt
 
+def _as_num_list(v):
+    """Coerce ctx.closes / recent_* / JsProxy of a JS array into a real Python
+    list of floats. Same tight loop for real lists (early return), safe for
+    proxies. Bulletproof against the Pyodide JsProxy quirk where indexing a
+    JS-array-backed proxy from a hot Python loop can silently short-circuit
+    on some 0.28.x builds."""
+    if isinstance(v, list):
+        return v
+    try:
+        return list(v)
+    except TypeError:
+        return v
+
+def _as_bar_list(v):
+    if isinstance(v, list):
+        return v
+    try:
+        return list(v)
+    except TypeError:
+        return v
+
 def is_finite(x):
     """True if x is a real, finite number (not NaN, not inf)."""
     try:
@@ -34,6 +55,7 @@ def is_finite(x):
 
 def sma(values, length):
     """Simple moving average. NaN for i < length - 1."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length > n:
@@ -49,6 +71,7 @@ def sma(values, length):
 
 def ema(values, length):
     """Exponential MA. Seeded with SMA of the first 'length' values."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length > n:
@@ -71,6 +94,7 @@ def ema(values, length):
 
 def rma(values, length):
     """Wilder's smoothing (aka RMA). Used by RSI/ATR."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length > n:
@@ -93,6 +117,7 @@ def rma(values, length):
 
 def wma(values, length):
     """Linearly-weighted moving average (older bars weighted less)."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length > n:
@@ -107,6 +132,7 @@ def wma(values, length):
 
 def stdev(values, length):
     """Population standard deviation over rolling window of 'length'."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 1 or length > n:
@@ -119,6 +145,7 @@ def stdev(values, length):
 
 def highest(values, length):
     """Rolling maximum. NaN for i < length - 1."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length > n:
@@ -129,6 +156,7 @@ def highest(values, length):
 
 def lowest(values, length):
     """Rolling minimum. NaN for i < length - 1."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length > n:
@@ -139,6 +167,7 @@ def lowest(values, length):
 
 def change(values, length=1):
     """First (or Nth) differences. NaN for i < length."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length < 1 or length >= n:
@@ -151,6 +180,7 @@ def change(values, length=1):
 
 def rsi(values, length=14):
     """Relative Strength Index (Wilder's smoothing)."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length <= 0 or length + 1 > n:
@@ -199,6 +229,7 @@ def bbands(values, length=20, mult=2.0):
     return upper, basis, lower
 
 def _true_range(bars):
+    bars = _as_bar_list(bars)
     n = len(bars)
     out = [nan] * n
     if n == 0:
@@ -216,6 +247,7 @@ def atr(bars, length=14):
 
 def vwap(bars):
     """Volume-weighted average price, anchored to each UTC day."""
+    bars = _as_bar_list(bars)
     n = len(bars)
     out = [nan] * n
     if n == 0:
@@ -239,6 +271,7 @@ def vwap(bars):
 
 def roc(values, length):
     """Rate of change (percent), NaN until enough history."""
+    values = _as_num_list(values)
     n = len(values)
     out = [nan] * n
     if length < 1 or length >= n:
@@ -257,6 +290,7 @@ def momentum(values, length):
 
 def cross_up(a, b):
     """True on the bar where series 'a' just crossed above series 'b'."""
+    a = _as_num_list(a); b = _as_num_list(b)
     if len(a) < 2 or len(b) < 2:
         return False
     return is_finite(a[-2]) and is_finite(b[-2]) and is_finite(a[-1]) and is_finite(b[-1]) \
@@ -264,6 +298,7 @@ def cross_up(a, b):
 
 def cross_down(a, b):
     """True on the bar where series 'a' just crossed below series 'b'."""
+    a = _as_num_list(a); b = _as_num_list(b)
     if len(a) < 2 or len(b) < 2:
         return False
     return is_finite(a[-2]) and is_finite(b[-2]) and is_finite(a[-1]) and is_finite(b[-1]) \
