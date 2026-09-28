@@ -60,6 +60,10 @@ export interface BacktestResult {
   finalBalance: number
   logs: string[]
   error: string | null
+  /** How many bars raised a Python exception. 0 on a clean run. */
+  errorCount: number
+  /** Bars actually simulated — less than bars.length if the run aborted. */
+  barsProcessed: number
   runtimeSeconds: number
 }
 
@@ -191,16 +195,31 @@ from math import nan
   // Iterate bars. Progress messages are throttled to keep the UI responsive
   // without paying a React-render cost per bar (typical run is 10k-50k bars).
   const REPORT_EVERY = Math.max(1, Math.floor(cfg.bars.length / 40))
+  // A throwing on_bar used to kill the whole run on the first bad bar, which
+  // made a broken strategy look identical to a strategy that simply never
+  // traded. Now we record the first error, keep going, and only abort once
+  // it's clear every bar is failing.
+  const MAX_ERRORS = 50
   let error: string | null = null
+  let errorCount = 0
+  let barsProcessed = 0
 
   for (let i = 0; i < cfg.bars.length; i++) {
     state.tick(i)
+    barsProcessed = i + 1
     try {
       // Call on_bar with the shared ctx. Pyodide bridges JS objects transparently.
       on_bar(ctx)
     } catch (e: any) {
-      error = `Runtime error at bar ${i} (${new Date(cfg.bars[i].time * 1000).toISOString()}): ${e?.message ?? e}`
-      break
+      errorCount++
+      if (!error) {
+        const at = new Date(cfg.bars[i].time * 1000).toISOString()
+        error = `Python error at bar ${i + 1} (${at}):\n${e?.message ?? e}`
+      }
+      if (errorCount >= MAX_ERRORS) {
+        error += `\n\nAborted after ${errorCount} failing bars — the error above is raised on essentially every bar. Fix it and re-run.`
+        break
+      }
     }
     if (i % REPORT_EVERY === 0) {
       onProgress?.({
@@ -215,12 +234,22 @@ from math import nan
   // Flush any remaining open position at the last bar so equity is consistent.
   state.flushOpenAtEnd()
 
+  // Always leave a trail in the logs so "did it actually do anything?" is
+  // answerable without guessing from the stat cards.
+  logs.push(
+    `[runner] done — ${barsProcessed.toLocaleString()} bars simulated, ` +
+    `${state.trades.length} trade(s) recorded, final balance ${state.balance.toFixed(2)}` +
+    (errorCount ? `, ${errorCount} bar(s) raised an error` : ''),
+  )
+
   return {
     trades: state.trades,
     equity: state.equity,
     finalBalance: +state.balance.toFixed(2),
     logs,
     error,
+    errorCount,
+    barsProcessed,
     runtimeSeconds: (performance.now() - t0) / 1000,
   }
 }
@@ -272,6 +301,7 @@ function baseError(msg: string, t0: number, cfg: BacktestConfig): BacktestResult
   return {
     trades: [], equity: [], finalBalance: cfg.startingBalance,
     logs: [], error: msg,
+    errorCount: 1, barsProcessed: 0,
     runtimeSeconds: (performance.now() - t0) / 1000,
   }
 }

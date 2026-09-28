@@ -303,7 +303,8 @@ export default function Strategies() {
     } catch (e: any) {
       setResult({
         trades: [], equity: [], finalBalance: draft.startingBalance,
-        logs: [], error: String(e?.message ?? e), runtimeSeconds: 0,
+        logs: [], error: String(e?.message ?? e),
+        errorCount: 1, barsProcessed: 0, runtimeSeconds: 0,
       })
     } finally {
       setRunning(false)
@@ -602,21 +603,25 @@ function ResultsPanel({ result, strategy }: { result: BacktestResult; strategy: 
   const hourStats = useMemo(() => hourlyBreakdown(result.trades), [result.trades])
   const dowStats = useMemo(() => dowBreakdown(result.trades), [result.trades])
 
-  if (result.error) {
-    return (
-      <div className="p-4">
-        <div className="text-xs text-down whitespace-pre-wrap">{result.error}</div>
-        {result.logs.length > 0 && (
-          <details className="mt-3 text-[11px] text-muted"><summary className="cursor-pointer">Logs</summary>
-            <pre className="whitespace-pre-wrap mt-1">{result.logs.join('\n')}</pre>
-          </details>
-        )}
-      </div>
-    )
-  }
-
   return (
     <div className="p-3 space-y-3">
+      {/* Errors get a loud banner ABOVE the results rather than replacing them —
+          a strategy that threw on some bars still produced partial results
+          worth seeing, and hiding the stats made a thrown exception look
+          identical to "never traded". */}
+      {result.error && (
+        <div className="rounded-lg border border-down/50 bg-down/10 p-3 space-y-1">
+          <div className="text-sm font-semibold text-down">
+            ⚠ Strategy raised a Python error
+            {result.errorCount > 1 && <span className="font-normal"> — on {result.errorCount.toLocaleString()} bars</span>}
+          </div>
+          <pre className="text-[11px] text-ink2 whitespace-pre-wrap leading-relaxed">{result.error}</pre>
+          <div className="text-[11px] text-muted">
+            Simulated {result.barsProcessed.toLocaleString()} bars before this report. Fix the error above, then Run again.
+          </div>
+        </div>
+      )}
+
       {/* Stats grid */}
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2">
         <MiniStat label="Net P&L" value={<PnlText v={summary.netPnl} digits={0} />} />
@@ -732,11 +737,22 @@ function ResultsPanel({ result, strategy }: { result: BacktestResult; strategy: 
         </div>
       )}
 
-      {result.logs.length > 0 && (
-        <details className="text-[11px] text-muted card !p-2"><summary className="cursor-pointer">Logs ({result.logs.length})</summary>
-          <pre className="whitespace-pre-wrap mt-1">{result.logs.join('\n')}</pre>
-        </details>
-      )}
+      {/* Always rendered — an empty Logs section tells you ctx.log() never
+          fired, which is itself diagnostic. Open by default when the run
+          errored or produced no trades, since that's when you need it. */}
+      <details
+        className="text-[11px] text-muted card !p-2"
+        open={!!result.error || result.trades.length === 0}
+      >
+        <summary className="cursor-pointer">Logs ({result.logs.length})</summary>
+        {result.logs.length > 0 ? (
+          <pre className="whitespace-pre-wrap mt-1 max-h-72 overflow-y-auto">{result.logs.join('\n')}</pre>
+        ) : (
+          <div className="mt-1">
+            No output — your strategy never called <span className="text-ink2">ctx.log(...)</span>.
+          </div>
+        )}
+      </details>
     </div>
   )
 }
