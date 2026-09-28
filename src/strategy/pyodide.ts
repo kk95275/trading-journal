@@ -4,12 +4,12 @@
 // deliberately kept small — the strategy runner and page only see a plain
 // {runPython, callFunction, isReady} surface.
 
-// Pyodide version pinned so we don't get surprise breaking changes on cdnjs.
-// NB: cdnjs mirrors pyodide with a FLAT layout (no `/full/` subdirectory) —
-// files like pyodide.js and pyodide.asm.wasm sit directly under the version
-// directory. jsdelivr uses `/full/` but cdnjs doesn't.
+// Pyodide version pinned so we don't get surprise breaking changes on the CDN.
+// NB: we serve from jsdelivr because cdnjs is missing `python_stdlib.zip` and
+// `pyodide-lock.json` (returns 403/404), and Pyodide can't boot without them —
+// user got "Program terminated with exit(1)" on v1.8.1 for that reason.
 const PYODIDE_VERSION = '0.28.3'
-const PYODIDE_BASE = `https://cdnjs.cloudflare.com/ajax/libs/pyodide/${PYODIDE_VERSION}/`
+const PYODIDE_BASE = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`
 const PYODIDE_JS = `${PYODIDE_BASE}pyodide.js`
 
 // Pyodide attaches loadPyodide to window; we don't want to fight the global.
