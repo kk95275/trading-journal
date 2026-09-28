@@ -104,7 +104,14 @@ same for all three OSes and publishes them to GitHub Releases automatically — 
 - **Journal** — daily notes with a mood/discipline rating.
 - **Playbook** — define setups + confirmation checklists (used by the Backtest order ticket),
   see which setups have edge and what mistakes cost you.
-- **Settings** — accounts, instruments (add/delete chart data), session defaults, JSON backup/restore.
+- **Strategies** — write algorithmic strategies in Python and backtest them over your 1m data.
+  Multi-timeframe OHLC, a bundled indicator library, equity curve + hour/day-of-week breakdowns,
+  and an optional AI review of when the strategy actually has edge.
+  **→ See [STRATEGY-GUIDE.md](STRATEGY-GUIDE.md) for the full API and worked examples.**
+- **AI Chat** — bring-your-own-key chat (OpenAI / Anthropic / Gemini / OpenRouter / Ollama) that can
+  read your trade history for context. Keys are encrypted with your OS keychain.
+- **Settings** — accounts, instruments (add/delete chart data), custom indicators, AI models,
+  session defaults, JSON backup/restore.
 
 ## Data & simulation notes
 
