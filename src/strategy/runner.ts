@@ -64,6 +64,8 @@ export interface BacktestResult {
   errorCount: number
   /** Bars actually simulated — less than bars.length if the run aborted. */
   barsProcessed: number
+  /** True when the user pressed Stop. Results are partial but valid. */
+  cancelled: boolean
   runtimeSeconds: number
 }
 
@@ -147,11 +149,33 @@ export interface RunProgress {
   message: string
 }
 
+/**
+ * Macrotask yield that hands control back to the browser so it can paint.
+ * Uses MessageChannel rather than setTimeout(0) because browsers clamp nested
+ * setTimeout to ~4ms — at the yield frequency we want that clamp alone would
+ * add minutes to a long run.
+ */
+function makeYielder(): () => Promise<void> {
+  if (typeof MessageChannel === 'undefined') {
+    return () => new Promise<void>(r => { setTimeout(r, 0) })
+  }
+  const ch = new MessageChannel()
+  let pending: (() => void) | null = null
+  ch.port1.onmessage = () => { const r = pending; pending = null; r?.() }
+  return () => new Promise<void>(res => { pending = res; ch.port2.postMessage(0) })
+}
+
+/** Give the UI a frame's worth of breathing room roughly this often. */
+const YIELD_BUDGET_MS = 24
+/** React re-renders are far more expensive than a yield — throttle them harder. */
+const PROGRESS_EVERY_MS = 200
+
 export async function runBacktest(
   cfg: BacktestConfig,
   files: StrategyFile[],
   mainFile: string,
   onProgress?: (p: RunProgress) => void,
+  signal?: AbortSignal,
 ): Promise<BacktestResult> {
   const t0 = performance.now()
   onProgress?.({ processed: 0, total: cfg.bars.length, message: 'Loading Python runtime…' })
@@ -206,7 +230,6 @@ globals().pop("on_bar", None)
 
   // Iterate bars. Progress messages are throttled to keep the UI responsive
   // without paying a React-render cost per bar (typical run is 10k-50k bars).
-  const REPORT_EVERY = Math.max(1, Math.floor(cfg.bars.length / 40))
   // A throwing on_bar used to kill the whole run on the first bad bar, which
   // made a broken strategy look identical to a strategy that simply never
   // traded. Now we record the first error, keep going, and only abort once
@@ -215,6 +238,16 @@ globals().pop("on_bar", None)
   let error: string | null = null
   let errorCount = 0
   let barsProcessed = 0
+  let cancelled = false
+
+  // Yield on a TIME budget, not every Nth bar. Bar cost varies hugely with
+  // strategy complexity (a multi-timeframe strategy can be 50x a bare one),
+  // so a fixed bar interval either freezes the UI for tens of seconds or
+  // yields pointlessly often. Time-based keeps it at a steady frame rate
+  // regardless of what the strategy does.
+  const yieldNow = makeYielder()
+  let lastYieldAt = performance.now()
+  let lastProgressAt = 0
 
   for (let i = 0; i < cfg.bars.length; i++) {
     state.tick(i)
@@ -233,14 +266,20 @@ globals().pop("on_bar", None)
         break
       }
     }
-    if (i % REPORT_EVERY === 0) {
-      onProgress?.({
-        processed: i + 1,
-        total: cfg.bars.length,
-        message: `Simulating bar ${i + 1} / ${cfg.bars.length}`,
-      })
-      // Yield to the event loop so the UI can paint mid-run.
-      await new Promise(r => setTimeout(r, 0))
+
+    const nowMs = performance.now()
+    if (nowMs - lastYieldAt >= YIELD_BUDGET_MS) {
+      if (nowMs - lastProgressAt >= PROGRESS_EVERY_MS) {
+        lastProgressAt = nowMs
+        onProgress?.({
+          processed: i + 1,
+          total: cfg.bars.length,
+          message: `Simulating bar ${(i + 1).toLocaleString()} / ${cfg.bars.length.toLocaleString()}`,
+        })
+      }
+      await yieldNow()
+      lastYieldAt = performance.now()
+      if (signal?.aborted) { cancelled = true; break }
     }
   }
   // Flush any remaining open position at the last bar so equity is consistent.
@@ -249,7 +288,7 @@ globals().pop("on_bar", None)
   // Always leave a trail in the logs so "did it actually do anything?" is
   // answerable without guessing from the stat cards.
   logs.push(
-    `[runner] done — ${barsProcessed.toLocaleString()} bars simulated, ` +
+    `[runner] ${cancelled ? 'STOPPED' : 'done'} — ${barsProcessed.toLocaleString()} bars simulated, ` +
     `${state.trades.length} trade(s) recorded, final balance ${state.balance.toFixed(2)}` +
     (errorCount ? `, ${errorCount} bar(s) raised an error` : ''),
   )
@@ -262,6 +301,7 @@ globals().pop("on_bar", None)
     error,
     errorCount,
     barsProcessed,
+    cancelled,
     runtimeSeconds: (performance.now() - t0) / 1000,
   }
 }
@@ -313,7 +353,7 @@ function baseError(msg: string, t0: number, cfg: BacktestConfig): BacktestResult
   return {
     trades: [], equity: [], finalBalance: cfg.startingBalance,
     logs: [], error: msg,
-    errorCount: 1, barsProcessed: 0,
+    errorCount: 1, barsProcessed: 0, cancelled: false,
     runtimeSeconds: (performance.now() - t0) / 1000,
   }
 }

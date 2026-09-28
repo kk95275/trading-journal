@@ -70,6 +70,7 @@ export default function Strategies() {
   // 'monaco-editor' (which we lazy-load; keeping the type dep-free is fine).
   const editorRef = useRef<any>(null)
   const monacoRef = useRef<any>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   const active = strategies.find(s => s.id === activeId) ?? null
 
@@ -174,6 +175,12 @@ export default function Strategies() {
     }
   }
 
+  /** Abort an in-flight backtest. Partial results still render. */
+  const stopRun = () => {
+    abortRef.current?.abort()
+    setProgress(p => p ? { ...p, message: 'Stopping…' } : p)
+  }
+
   const formatNow = () => {
     if (!draft) return
     const files = (draft.files ?? []).map(f =>
@@ -250,6 +257,8 @@ export default function Strategies() {
     if (!draft || running) return
     setRunning(true)
     setResult(null)
+    const abort = new AbortController()
+    abortRef.current = abort
     try {
       setProgress({ processed: 0, total: 0, message: 'Loading data…' })
       const chunks = await chunksFor(draft.symbol, '1m')
@@ -298,17 +307,19 @@ export default function Strategies() {
         files,
         mainFile,
         p => setProgress(p),
+        abort.signal,
       )
       setResult(r)
     } catch (e: any) {
       setResult({
         trades: [], equity: [], finalBalance: draft.startingBalance,
         logs: [], error: String(e?.message ?? e),
-        errorCount: 1, barsProcessed: 0, runtimeSeconds: 0,
+        errorCount: 1, barsProcessed: 0, cancelled: false, runtimeSeconds: 0,
       })
     } finally {
       setRunning(false)
       setProgress(null)
+      abortRef.current = null
     }
   }
 
@@ -397,7 +408,7 @@ export default function Strategies() {
                 <button className="btn-ghost text-xs" onClick={save} disabled={!draft.name.trim()}>Save</button>
                 {draft.id !== undefined && <button className="btn-ghost text-xs !text-down" onClick={del}>Delete</button>}
                 {running
-                  ? <button className="btn-ghost text-xs" disabled>Running…</button>
+                  ? <button className="btn-ghost text-xs !text-down" onClick={stopRun}>■ Stop</button>
                   : <button className="btn-primary text-xs" onClick={run}>▶ Run backtest</button>}
               </div>
 
@@ -485,6 +496,7 @@ export default function Strategies() {
           onMount={onEditorMount}
           onSave={save}
           onRun={run}
+          onStop={stopRun}
           running={running}
           onClose={() => setExpanded(false)}
         />
@@ -512,6 +524,7 @@ interface ExpandedEditorProps {
   onMount: OnMount
   onSave: () => void | Promise<void>
   onRun: () => void | Promise<void>
+  onStop: () => void
   running: boolean
   onClose: () => void
 }
@@ -536,7 +549,7 @@ function ExpandedEditor(p: ExpandedEditorProps) {
         <div className="flex-1" />
         <button className="btn-ghost text-xs" onClick={p.onSave}>Save</button>
         {p.running
-          ? <button className="btn-ghost text-xs" disabled>Running…</button>
+          ? <button className="btn-ghost text-xs !text-down" onClick={p.onStop}>■ Stop</button>
           : <button className="btn-primary text-xs" onClick={p.onRun}>▶ Run</button>}
         <button className="btn-ghost text-xs" onClick={p.onClose} title="Restore normal layout (Esc)">⤡ Restore</button>
       </div>
@@ -598,10 +611,27 @@ function PyRuntimeBar({ pyStatus, progress }: { pyStatus: LoadStatus; progress: 
   )
 }
 
+/** Recharts chokes well before 90k points; the curve is visually identical. */
+const MAX_EQUITY_POINTS = 1500
+
 function ResultsPanel({ result, strategy }: { result: BacktestResult; strategy: StrategyDef }) {
   const summary = useMemo(() => summarize(result.trades), [result.trades])
   const hourStats = useMemo(() => hourlyBreakdown(result.trades), [result.trades])
   const dowStats = useMemo(() => dowBreakdown(result.trades), [result.trades])
+
+  // A 90k-bar run produces a 90k-point equity array. Feeding that straight to
+  // recharts locks the UI for seconds on every re-render, so downsample for
+  // display — stats above are still computed on the full series.
+  const equityForChart = useMemo(() => {
+    const e = result.equity
+    if (e.length <= MAX_EQUITY_POINTS) return e
+    const step = Math.ceil(e.length / MAX_EQUITY_POINTS)
+    const out = []
+    for (let i = 0; i < e.length; i += step) out.push(e[i])
+    const last = e[e.length - 1]
+    if (out[out.length - 1] !== last) out.push(last) // keep the true final balance
+    return out
+  }, [result.equity])
 
   return (
     <div className="p-3 space-y-3">
@@ -619,6 +649,12 @@ function ResultsPanel({ result, strategy }: { result: BacktestResult; strategy: 
           <div className="text-[11px] text-muted">
             Simulated {result.barsProcessed.toLocaleString()} bars before this report. Fix the error above, then Run again.
           </div>
+        </div>
+      )}
+
+      {result.cancelled && (
+        <div className="rounded-lg border border-warn/50 bg-warn/10 px-3 py-2 text-[11px] text-warn">
+          ■ Stopped early — these are partial results from the first {result.barsProcessed.toLocaleString()} bars.
         </div>
       )}
 
@@ -644,7 +680,7 @@ function ResultsPanel({ result, strategy }: { result: BacktestResult; strategy: 
           <div className="text-[11px] text-muted mb-1">Equity curve</div>
           <div style={{ width: '100%', height: 160 }}>
             <ResponsiveContainer>
-              <LineChart data={result.equity} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
+              <LineChart data={equityForChart} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid stroke={GRID} strokeDasharray="3 3" />
                 <XAxis dataKey="time" tick={{ fontSize: 10, fill: AXIS }} tickFormatter={t => new Date(t * 1000).toISOString().slice(0, 10)} minTickGap={40} />
                 <YAxis tick={{ fontSize: 10, fill: AXIS }} tickFormatter={v => (v / 1000).toFixed(1) + 'k'} width={44} />
