@@ -98,7 +98,10 @@ const CONTRACT_HEADER =
 `# Backtest runner injects these globals before your code runs:
 #   on_bar(ctx) — implement this
 # ctx exposes:
-#   now, price, ask, bid, spread, balance, position
+#   now, price, ask, bid, spread, balance
+#   position      -> dict when in a trade, None when flat
+#   has_position  -> bool, True when in a trade
+#   is_flat       -> bool, True when flat  (reads better than 'not has_position')
 #   open, high, low, close, volume        (current bar values)
 #   opens, highs, lows, closes, volumes   (arrays: [-1] = now, [-n] = n bars ago)
 #   bars                                  (list of dicts, one per bar; bars[-1] = now)
@@ -454,17 +457,31 @@ class BookState {
       // underlying 1m bars. The last element of every array is the CURRENT
       // (forming) higher-tf bar, so `htf.closes[-2]` is the last completed one.
       tf(spec: string | number) { return self.getTfView(parseTfSpec(spec)) },
+      /**
+       * Current position, or None when flat.
+       *
+       * MUST return `undefined`, never `null`. Pyodide maps JS `undefined` to
+       * Python `None`, but JS `null` arrives as a distinct JsNull sentinel —
+       * which made `ctx.position is None` evaluate False even when flat,
+       * silently disabling every `if ctx.position is None:` entry guard and
+       * making `ctx.position is not None` always True.
+       */
       get position() {
-        if (!self.position) return null
+        if (!self.position) return undefined
         return {
           direction: self.position.direction,
           entry: self.position.entryPrice,
           lots: self.position.lots,
-          sl: self.position.sl ?? null,
-          tp: self.position.tp ?? null,
+          // undefined (not null) so `pos["sl"] is None` works in Python.
+          sl: self.position.sl,
+          tp: self.position.tp,
           entry_time: self.position.entryTime,
         }
       },
+      /** Unambiguous boolean — immune to any null/undefined conversion rules. */
+      get has_position() { return self.position !== null },
+      /** True when flat. Reads better than `not ctx.has_position`. */
+      get is_flat() { return self.position === null },
       // Ordering.
       // Ordering. Pyodide passes Python kwargs to JS by bundling them into a
       // final positional object — `ctx.buy(0.05, sl=X, tp=Y)` arrives here as
