@@ -12,6 +12,7 @@ import Journal from './pages/Journal'
 import Playbook from './pages/Playbook'
 import ReplayWindow from './pages/ReplayWindow'
 import Settings from './pages/Settings'
+import Strategies from './pages/Strategies'
 import Trades from './pages/Trades'
 
 type NavItem =
@@ -27,7 +28,8 @@ const NAV: NavItem[] = [
   { kind: 'link', to: '/journal',   label: 'Journal',    icon: '📝' },
   { kind: 'link', to: '/playbook',  label: 'Playbook',   icon: '📖' },
   { kind: 'section', label: 'Backtesting' },
-  { kind: 'link', to: '/backtest',  label: 'Backtest',   icon: '📉' },
+  { kind: 'link', to: '/backtest',   label: 'Backtest',   icon: '📉' },
+  { kind: 'link', to: '/strategies', label: 'Strategies', icon: '🐍' },
   { kind: 'section', label: 'AI' },
   { kind: 'link', to: '/ai',        label: 'AI Chat',    icon: '🤖' },
 ]
@@ -106,6 +108,7 @@ export default function App() {
           <Route path="/journal"    element={<Journal />} />
           <Route path="/playbook"   element={<Playbook />} />
           <Route path="/backtest"   element={<Backtest />} />
+          <Route path="/strategies" element={<Strategies />} />
           <Route path="/ai"         element={<AIChat />} />
           <Route path="/settings"   element={<Settings />} />
         </Routes>

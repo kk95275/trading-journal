@@ -28,6 +28,20 @@ export interface CustomIndicatorDef {
   updatedAt: number
 }
 
+export interface StrategyDef {
+  id?: number
+  name: string
+  code: string           // Python source — see src/strategy/runner.ts contract
+  symbol: string         // default instrument to backtest against
+  from?: number          // epoch seconds, inclusive; undefined = all available data
+  to?: number
+  spread: number
+  commissionPerLot: number
+  startingBalance: number
+  createdAt: number
+  updatedAt: number
+}
+
 class TradingJournalDB extends Dexie {
   accounts!: Table<Account, number>
   trades!: Table<Trade, number>
@@ -36,6 +50,7 @@ class TradingJournalDB extends Dexie {
   settings!: Table<SettingRow, string>
   aiConversations!: Table<AIConversation, number>
   customIndicators!: Table<CustomIndicatorDef, number>
+  strategies!: Table<StrategyDef, number>
 
   constructor() {
     super('trading-journal')
@@ -51,6 +66,9 @@ class TradingJournalDB extends Dexie {
     })
     this.version(3).stores({
       customIndicators: '++id, name, updatedAt',
+    })
+    this.version(4).stores({
+      strategies: '++id, name, symbol, updatedAt',
     })
   }
 }
