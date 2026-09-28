@@ -427,29 +427,39 @@ class BookState {
         }
       },
       // Ordering.
-      buy(lots: number, sl: number | null = null, tp: number | null = null) {
+      // Ordering. Pyodide passes Python kwargs to JS by bundling them into a
+      // final positional object — `ctx.buy(0.05, sl=X, tp=Y)` arrives here as
+      // `buy(0.05, {sl:X, tp:Y})`. Detect the object case and unpack so both
+      // calling styles work.
+      buy(lots: number, sl?: any, tp?: any) {
+        if (typeof sl === 'object' && sl !== null) { tp = sl.tp; sl = sl.sl }
         if (self.position) return false
-        if (!(lots > 0)) return false
+        if (!(typeof lots === 'number' && lots > 0)) return false
+        const slN = typeof sl === 'number' && isFinite(sl) ? sl : undefined
+        const tpN = typeof tp === 'number' && isFinite(tp) ? tp : undefined
         self.position = {
           direction: 'long',
           entryPrice: self.ask,
           entryTime: self.curBar.time,
           lots,
-          sl: sl ?? undefined,
-          tp: tp ?? undefined,
+          sl: slN,
+          tp: tpN,
         }
         return true
       },
-      sell(lots: number, sl: number | null = null, tp: number | null = null) {
+      sell(lots: number, sl?: any, tp?: any) {
+        if (typeof sl === 'object' && sl !== null) { tp = sl.tp; sl = sl.sl }
         if (self.position) return false
-        if (!(lots > 0)) return false
+        if (!(typeof lots === 'number' && lots > 0)) return false
+        const slN = typeof sl === 'number' && isFinite(sl) ? sl : undefined
+        const tpN = typeof tp === 'number' && isFinite(tp) ? tp : undefined
         self.position = {
           direction: 'short',
           entryPrice: self.bid,
           entryTime: self.curBar.time,
           lots,
-          sl: sl ?? undefined,
-          tp: tp ?? undefined,
+          sl: slN,
+          tp: tpN,
         }
         return true
       },
@@ -467,8 +477,14 @@ class BookState {
         self.fillExit(exit, 'manual')
         return true
       },
-      set_sl(sl: number | null) { if (self.position) self.position.sl = sl ?? undefined },
-      set_tp(tp: number | null) { if (self.position) self.position.tp = tp ?? undefined },
+      set_sl(sl: any) {
+        if (typeof sl === 'object' && sl !== null && 'sl' in sl) sl = sl.sl
+        if (self.position) self.position.sl = typeof sl === 'number' && isFinite(sl) ? sl : undefined
+      },
+      set_tp(tp: any) {
+        if (typeof tp === 'object' && tp !== null && 'tp' in tp) tp = tp.tp
+        if (self.position) self.position.tp = typeof tp === 'number' && isFinite(tp) ? tp : undefined
+      },
       log(msg: unknown) {
         const s = typeof msg === 'string' ? msg : JSON.stringify(msg)
         if (logs.length < 500) logs.push(`[${new Date(self.curBar.time * 1000).toISOString()}] ${s}`)
