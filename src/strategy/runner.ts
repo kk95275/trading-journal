@@ -175,6 +175,10 @@ from ta import (
     cross_up, cross_down, is_finite,
 )
 from math import nan
+# Drop any on_bar left over from a previous run. Without this, a file that
+# fails to define on_bar silently reuses the PREVIOUS strategy's function,
+# which looks like "my new strategy does nothing".
+globals().pop("on_bar", None)
 `,
     )
     py.runPython(`${CONTRACT_HEADER}\n${main.content}`)
@@ -184,7 +188,12 @@ from math import nan
 
   const on_bar = py.globals.get('on_bar')
   if (!on_bar || typeof on_bar.callKwargs !== 'function' && typeof on_bar !== 'function') {
-    return baseError(`Your ${mainFile} did not define an on_bar(ctx) function.`, t0, cfg)
+    return baseError(
+      `${mainFile} does not define an on_bar(ctx) function.\n\n` +
+      `Every strategy needs a top-level:\n\n    def on_bar(ctx):\n        ...\n\n` +
+      `If you split the strategy across files, make sure the file marked ★ (main) is the one that defines it.`,
+      t0, cfg,
+    )
   }
 
   const state = new BookState(cfg)

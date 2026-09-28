@@ -1,7 +1,7 @@
 {
   "name": "trading-journal",
   "private": true,
-  "version": "1.10.3",
+  "version": "1.10.4",
   "description": "Local-first trading journal + bar-replay backtester",
   "author": {
     "name": "Karim Khalil",
