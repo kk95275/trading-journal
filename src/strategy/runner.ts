@@ -95,9 +95,12 @@ const CONTRACT_HEADER =
 #   on_bar(ctx) — implement this
 # ctx exposes:
 #   now, price, ask, bid, spread, balance, position
-#   open, high, low, close, volume        (current bar)
-#   opens, highs, lows, closes, volumes   (arrays up to current bar)
-#   bars                                  (list of dicts, one per bar)
+#   open, high, low, close, volume        (current bar values)
+#   opens, highs, lows, closes, volumes   (arrays: [-1] = now, [-n] = n bars ago)
+#   bars                                  (list of dicts, one per bar; bars[-1] = now)
+#   recent_closes(n), recent_highs(n), recent_lows(n), recent_opens(n),
+#   recent_volumes(n), recent_bars(n)     (last n values as a real list)
+# Python slicing works too: list(ctx.closes)[-20:] returns the last 20 closes.
 #   buy(lots, sl=None, tp=None), sell(...), exit()/close_position(), set_sl(px), set_tp(px), log(msg)
 #
 # Also available at module level (no imports needed):
@@ -372,6 +375,15 @@ class BookState {
       lows:    buildFieldProxy(self.cfg.bars, 'low',    () => self.curIdx),
       closes:  buildFieldProxy(self.cfg.bars, 'close',  () => self.curIdx),
       volumes: buildFieldProxy(self.cfg.bars, 'volume', () => self.curIdx),
+      // Grab the last N values as a plain list — one line, no slice math.
+      // Python's slicing on the proxied arrays (list(ctx.closes)[-20:]) also
+      // works thanks to the [Symbol.iterator] implementation below.
+      recent_bars(n: number) { return tailBars(self.cfg.bars, self.curIdx, n) },
+      recent_opens(n: number)   { return tailField(self.cfg.bars, self.curIdx, n, 'open') },
+      recent_highs(n: number)   { return tailField(self.cfg.bars, self.curIdx, n, 'high') },
+      recent_lows(n: number)    { return tailField(self.cfg.bars, self.curIdx, n, 'low') },
+      recent_closes(n: number)  { return tailField(self.cfg.bars, self.curIdx, n, 'close') },
+      recent_volumes(n: number) { return tailField(self.cfg.bars, self.curIdx, n, 'volume') },
       get position() {
         if (!self.position) return null
         return {
@@ -439,14 +451,21 @@ class BookState {
 
 /**
  * Python-facing single-field accessor. `ctx.closes[-1]` returns the current
- * bar's close as a number. Length caps at curIdx + 1 so `sma(ctx.closes, 20)`
- * never peeks at future bars by accident.
+ * bar's close; `list(ctx.closes)` returns the full history so Python slicing
+ * works (`list(ctx.closes)[-20:]`). Length caps at curIdx + 1 so nothing
+ * — indexing, iteration, or slicing — can peek at future bars.
  */
 function buildFieldProxy<K extends keyof Bar>(bars: Bar[], key: K, getIdx: () => number): number[] {
   return new Proxy(bars, {
     get(target, prop) {
       const idx = getIdx()
       if (prop === 'length') return idx + 1
+      if (prop === Symbol.iterator) {
+        // Makes `for x in ctx.closes` and `list(ctx.closes)` work in Python.
+        return function* () {
+          for (let i = 0; i <= idx; i++) yield target[i][key] as number
+        }
+      }
       if (typeof prop === 'string' && /^-?\d+$/.test(prop)) {
         let i = Number(prop)
         if (i < 0) i = idx + 1 + i
@@ -458,25 +477,45 @@ function buildFieldProxy<K extends keyof Bar>(bars: Bar[], key: K, getIdx: () =>
   }) as unknown as number[]
 }
 
-/** Python-facing bars accessor. `ctx.bars[-1]` returns current bar dict. */
+/** Python-facing bars accessor. `ctx.bars[-1]` returns current bar dict;
+ * `list(ctx.bars)` returns a real list of dicts. */
 function buildBarsProxy(bars: Bar[], getIdx: () => number) {
-  // Pyodide preserves numeric indexing on plain JS arrays, but we want to
-  // *cap* the view at the current bar so users can't peek the future by
-  // accident. Return a wrapper with .length + numeric indexing that Pyodide
-  // handles fine via its default JS-array proxying.
+  const barDict = (b: Bar) => ({
+    time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume,
+  })
   return new Proxy(bars, {
     get(target, prop) {
       const idx = getIdx()
       if (prop === 'length') return idx + 1
+      if (prop === Symbol.iterator) {
+        return function* () {
+          for (let i = 0; i <= idx; i++) yield barDict(target[i])
+        }
+      }
       if (typeof prop === 'string' && /^-?\d+$/.test(prop)) {
         let i = Number(prop)
         if (i < 0) i = idx + 1 + i
         if (i < 0 || i > idx) return undefined
-        const b = target[i]
-        // Pyodide serializes plain objects to dict; keep fields flat.
-        return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume }
+        return barDict(target[i])
       }
       return (target as any)[prop]
     },
   }) as unknown as Bar[]
+}
+
+/** Last-N helpers. Return real arrays so Python slicing on the result works too. */
+function tailField(bars: Bar[], curIdx: number, n: number, key: keyof Bar): number[] {
+  const out: number[] = []
+  const from = Math.max(0, curIdx - Math.max(0, Math.floor(n)) + 1)
+  for (let i = from; i <= curIdx; i++) out.push(bars[i][key] as number)
+  return out
+}
+function tailBars(bars: Bar[], curIdx: number, n: number) {
+  const out: { time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
+  const from = Math.max(0, curIdx - Math.max(0, Math.floor(n)) + 1)
+  for (let i = from; i <= curIdx; i++) {
+    const b = bars[i]
+    out.push({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume })
+  }
+  return out
 }
