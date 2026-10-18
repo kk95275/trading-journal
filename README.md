@@ -57,6 +57,118 @@ XAUUSD,20030506,000100,341.534,341.95,341.453,341.695,9920
 Delete an instrument's chart data any time from the same Instruments screen — this can't be undone,
 but re-importing the same file restores it.
 
+## Backtesting against funded-challenge rules
+
+The backtester can hold you to a prop firm's evaluation rules while you replay, so a session answers
+"would this have passed?" and not just "was it profitable?". Two presets ship with the app:
+**IC Funded — 2-Step Professional 25K** and **FTMO — 2-Step Challenge 25K**.
+
+### Picking a rule set
+
+On the Backtest setup screen the **Rules** dropdown starts on `Normal backtesting — no rules`. Pick a
+firm and three stage tabs appear — Step 1 / Step 2 / Funded for IC, FTMO Challenge / Verification /
+FTMO Account for FTMO. Each stage has its own profit target, max drawdown and minimum trading days,
+so switching tab changes what you're held to; the funded stage has no target and just runs until you
+stop or breach. A summary underneath shows what you picked — target, daily loss, max drawdown, min
+trading days, margin cap, commission — plus that stage's own conditions.
+
+Where a firm's own pages disagree, the setup screen offers the choice rather than picking silently,
+and defaults to the stricter reading. IC's Step 1 max drawdown is 10% on its rules page and 8% in its
+Help Centre — 8% is the default, 10% is one click away. Its 5% daily loss can read as a fixed $1,250
+or as 5% of day-start equity, and you can switch which applies.
+
+### What gets enforced while you trade
+
+A strip above the chart tracks daily loss left, max drawdown left, progress to target, equity,
+trading days, margin use, risk flags, and a countdown to Friday close where the stage wants you flat
+for the weekend. Each rule is applied only where that firm actually imposes it:
+
+- **Daily loss floor**, rebased at the firm's own reset time and timezone
+- **Static max drawdown** off the starting balance — it never moves up with profit
+- **Margin exposure cap** (IC: 75% of equity) — an order that would exceed it is refused
+- **Hedging ban** (IC) — an opposite position is refused until you close the first one
+- **Weekend-flat deadline** — still holding at Friday close is a breach
+- **Minimum trading days** (days you opened at least one trade, in server time) before hitting the
+  target counts as a pass
+- **Soft per-idea risk warning** (IC: 1.5% of equity) — warns and counts a flag, never breaches
+
+The one thing worth understanding: **every limit is measured on equity — balance plus floating P&L —
+because that's how the firms measure it.** A trade that's deep underwater can breach the account
+before you ever close it. And the floors are tested against each bar's worst-case equity (longs
+marked to the bar's low, shorts to its high), so a wick through a floor breaches even if the bar
+closes back above it.
+
+A breach closes your open positions at market the way the firm would, names what broke, and refuses
+further orders. **Keep trading anyway** lets you carry on over the same data for practice — the run
+stays marked failed.
+
+### Saved sessions resume
+
+Every backtest session is saved, plain ones included. The setup screen lists in-progress sessions
+with a **Resume** button and finished ones in a history table. Resuming restores the bar you were on,
+the balance, and for a challenge run the floors, trading-day count and profitable days.
+
+A resumed session **starts flat** — a position open when you stopped is not carried, and the balance
+you get back is the realized one. Progress is saved roughly every 1.5s, so closing the app
+mid-playback can cost a couple of seconds of simulated time; trades and the breach-or-pass verdict
+are written immediately.
+
+### Check vs rules
+
+Any saved session has a **Check vs rules** button. Pick a firm and it replays that session's closed
+trades against every stage at once, reporting each as survived, breached or target-not-reached, with
+peak profit, worst drawdown, trading days, and how close the worst moment came to each floor.
+
+Two things keep that answer honest:
+
+- It **rebuilds equity minute by minute from your 1-minute bars** instead of trusting closed P&L, and
+  feeds it to the same rule tracker the live replay uses. A session that sat 6% underwater at lunch
+  and closed the day green has already breached; a closed-P&L check would call it a pass.
+- It **scales position sizes by challenge balance / session balance**, so a strategy tested on
+  $10,000 is judged at the challenge's size with proportional risk (2.50x for a $25K preset). P&L,
+  fees and risk are all linear in lots, so the scaling is exact.
+
+A stage that can't be computed — no closed trades, no 1-minute data for the symbol, or too long a
+span to walk minute by minute — says so instead of guessing.
+
+### Where the two presets differ
+
+Both run a 5% daily loss, a 10% then 5% profit target, and a static (non-trailing) max drawdown of
+10% — except IC's Step 1, which defaults to the stricter 8% reading. The rest isn't obvious:
+
+| | IC Funded 25K | FTMO 25K |
+|---|---|---|
+| Daily floor measured from | end-of-day equity | the balance at the reset, so a floating loss held over midnight doesn't drag the next day's floor down |
+| Daily reset timezone | EET (UTC+2/+3) | CE(S)T (UTC+1/+2) |
+| Min trading days | 3 | 4 |
+| Hedging | not allowed | allowed |
+| Margin cap | 75% of equity | none |
+| News and weekend limits | flat before Friday close at every stage; news blackout once funded | only once funded — Challenge and Verification may hold over a weekend and trade through news |
+| Commission | $4/lot round-turn | varies by instrument — set it per session |
+
+### What isn't simulated
+
+Only the rules that can be checked from price data are enforced. The setup panel lists the rest per
+firm (**Show N rules this simulator can't check**) rather than dropping them silently:
+
+- **Overnight swaps** — FTMO counts them in equity, and they add up when you hold for days
+- **Margin requirements and broker stop-out** — the firm's margin cap is enforced, the broker's isn't
+- **News blackouts** on the funded stage — the app has no economic calendar
+- **Consistency clauses** — lot size, frequency and risk exposure staying comparable, and the profit
+  concentration that can trigger a manual review
+- **Forbidden practices** — martingale and grid averaging, copy trading, rented EAs, HFT, tick
+  scalping, latency arbitrage, opposite positions across accounts
+- **Account-level terms** like inactivity termination and payout eligibility
+
+These presets are one reading of each firm's published rules, not legal or financial advice. Rules
+change and the firms' own terms govern — read the current ones yourself before you rely on a number
+in here.
+
+**Adding a firm or account size** (if you're reading the source): a rule set is plain data — one
+object in `RULE_SETS` in `src/lib/propRules.ts`, picked up by both the setup screen and the engine
+with no new engine or UI code. The live tracker is `RuleRuntime` in the same file; the retroactive
+check is `src/replay/challengeCheck.ts`.
+
 ## Running from source (for developers)
 
 **1. Prerequisites** — Node.js 20.11+ and npm (`node -v` to check).
@@ -94,7 +206,8 @@ same for all three OSes and publishes them to GitHub Releases automatically — 
 
 - **Backtest** — pick a start date within your converted data's range (GMT), replay 1m/5m/15m/1h/4h/1d candles,
   trade on the chart (draggable SL/TP), tick setup confirmations, write notes. Closed trades are
-  auto-saved to the journal with a chart screenshot.
+  auto-saved to the journal with a chart screenshot. Sessions are saved and resumable, and can be
+  run under a funded-challenge rule set (above).
   Hotkeys: `space` play/pause · `→` step one bar · `↑`/`↓` speed.
 - **Dashboard** — equity curve, win rate, profit factor, expectancy, R totals, drawdown, streaks,
   P&L by day-of-week / hour / setup.
