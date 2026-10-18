@@ -116,7 +116,8 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
       if (rs && d.rules) {
         setSessionRules(d.rules)
         setBalance(rs.accountSize)
-        setCommission(rs.commissionPerLot)
+        // Firms whose commission varies by instrument leave the field alone.
+        if (rs.commissionPerLot !== undefined) setCommission(rs.commissionPerLot)
       }
       const sbs = d.spreadBySymbol ?? (d.spread !== undefined ? { XAUUSD: d.spread } : {})
       setSpreadBySymbol(sbs)
@@ -133,7 +134,7 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
     const rs = ruleSetById(v?.ruleSetId)
     if (!rs || !v) return
     setBalance(rs.accountSize)
-    setCommission(rs.commissionPerLot)
+    if (rs.commissionPerLot !== undefined) setCommission(rs.commissionPerLot)
     if (accountId === 'new') setNewName(`${rs.firm} ${rs.accountSize / 1000}K — ${stageOf(rs, v.stageId).name}`)
   }
 
@@ -290,8 +291,8 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
               <label className="label">Commission /lot</label>
               <input
                 type="number" step="0.5" min="0" className="input disabled:opacity-50"
-                disabled={!!activeRuleSet}
-                title={activeRuleSet ? `Set by ${activeRuleSet.firm}` : undefined}
+                disabled={activeRuleSet?.commissionPerLot !== undefined}
+                title={activeRuleSet?.commissionPerLot !== undefined ? `Set by ${activeRuleSet.firm}` : undefined}
                 value={commission}
                 onChange={e => setCommission(+e.target.value)}
               />
