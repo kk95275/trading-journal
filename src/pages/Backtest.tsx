@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { db, getSetting, setSetting } from '../db'
+import { db, getSetting, setSetting, type ChallengeAttempt } from '../db'
 import type { Confirmation, Direction, Trade } from '../lib/types'
 import { fmtDateTime, fmtR, fmtUsd, riskUsd } from '../lib/gold'
 import { fmtPx, specFor } from '../lib/symbols'
@@ -11,12 +11,15 @@ import { ReplayEngine, getActiveEngine, setActiveEngine, type OpenPosition, type
 import { defaultSessionsConfig, type SessionsConfig } from '../replay/sessions'
 import { defaultIndicatorsConfig, migrateIndicatorsConfig, type IndicatorsConfig } from '../replay/indicators'
 import { openSyncChannel, snapshotOf, REPLAY_SYNC_LOCALSTORAGE, type SyncMessage } from '../replay/syncChannel'
+import { ruleSetById, stageOf, type SessionRules } from '../lib/propRules'
+import { deleteAttempt, sortAttempts, summarizeAttempt } from '../replay/attemptStore'
 import ReplayChart, { type ChartHandle } from '../components/ReplayChart'
 import SessionsPanel from '../components/SessionsPanel'
 import IndicatorsPanel from '../components/IndicatorsPanel'
 import { PnlText } from '../components/ui'
 import AnalyzeButton from '../components/AnalyzeButton'
 import SetupModal from '../components/SetupModal'
+import { AttemptsPanel, RuleBanner, RuleSetPicker, RulesHud } from '../components/RulesPanel'
 
 const MAX_PANES = 3
 
@@ -53,7 +56,12 @@ export default function Backtest() {
   if (!engine) {
     return <SessionSetup onStart={e => { setActiveEngine(e); setEngine(e) }} />
   }
-  return <Session engine={engine} onEnd={() => { setActiveEngine(null); setEngine(null) }} />
+  const end = () => {
+    void engine.endSession()
+    setActiveEngine(null)
+    setEngine(null)
+  }
+  return <Session engine={engine} onEnd={end} />
 }
 
 /* ---------------- session setup ---------------- */
@@ -69,10 +77,21 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
   const [spread, setSpread] = useState(0.3)
   const [commission, setCommission] = useState(6)
   const [balance, setBalance] = useState(10000)
+  const [sessionRules, setSessionRules] = useState<SessionRules | null>(null)
   const [ranges, setRanges] = useState<Record<string, { from: number; to: number }>>({})
   const [spreadBySymbol, setSpreadBySymbol] = useState<Record<string, number>>({})
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState('')
+
+  // Saved challenge attempts for whichever account is selected. A brand-new
+  // account has none, and plain backtesting never writes any.
+  const attempts = useLiveQuery(
+    () => typeof accountId === 'number'
+      ? db.challengeAttempts.where('accountId').equals(accountId).toArray()
+      : Promise.resolve([] as ChallengeAttempt[]),
+    [accountId],
+    [] as ChallengeAttempt[],
+  )
 
   useEffect(() => {
     // detect which symbols have converted data — re-runs whenever the instrument list
@@ -93,6 +112,12 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
       if (!d) return
       setCommission(d.commission ?? 6)
       setBalance(d.balance ?? 10000)
+      const rs = ruleSetById(d.rules?.ruleSetId)
+      if (rs && d.rules) {
+        setSessionRules(d.rules)
+        setBalance(rs.accountSize)
+        setCommission(rs.commissionPerLot)
+      }
       const sbs = d.spreadBySymbol ?? (d.spread !== undefined ? { XAUUSD: d.spread } : {})
       setSpreadBySymbol(sbs)
       const sym = d.lastSymbol && SYMBOL_LIST.includes(d.lastSymbol) ? d.lastSymbol : (SYMBOL_LIST[0] ?? 'XAUUSD')
@@ -102,11 +127,22 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // A funded account's size and commission are the firm's, not the trader's.
+  const pickRules = (v: SessionRules | null) => {
+    setSessionRules(v)
+    const rs = ruleSetById(v?.ruleSetId)
+    if (!rs || !v) return
+    setBalance(rs.accountSize)
+    setCommission(rs.commissionPerLot)
+    if (accountId === 'new') setNewName(`${rs.firm} ${rs.accountSize / 1000}K — ${stageOf(rs, v.stageId).name}`)
+  }
+
   const pickSymbol = (s: string) => {
     setSymbol(s)
     setSpread(spreadBySymbol[s] ?? specFor(s).defaultSpread)
   }
   const range = ranges[symbol] ?? null
+  const activeRuleSet = ruleSetById(sessionRules?.ruleSetId)
 
   useEffect(() => {
     if (accounts && accounts.length && accountId === 'new' && newName === 'Backtest 1') {
@@ -142,12 +178,17 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
       if (range && (startTs < range.from || startTs > range.to)) {
         throw new Error(`Start date is outside the data range (${fmtMonth(range.from)} → ${fmtMonth(range.to)}).`)
       }
-      const config: SessionConfig = { accountId: accId, accountName: accName, symbol, startTs, spread, commissionPerLot: commission, startingBalance: balance }
+      const config: SessionConfig = {
+        accountId: accId, accountName: accName, symbol, startTs, spread,
+        commissionPerLot: commission, startingBalance: balance,
+        rules: sessionRules ?? undefined,
+      }
       await setSetting('sessionDefaults', {
         lastSymbol: symbol,
         spreadBySymbol: { ...spreadBySymbol, [symbol]: spread },
         commission,
         balance,
+        rules: sessionRules,
       })
       const eng = await ReplayEngine.create(config)
       onStart(eng)
@@ -157,12 +198,52 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
     }
   }
 
+  /**
+   * Pick a saved attempt back up: same instrument and costs, the rule tracker
+   * rebuilt from its stored state, and the tape parked on the bar it stopped
+   * on. The session starts flat — any position still open when it was last
+   * saved is not carried, so the balance is the realized one.
+   */
+  const resume = async (a: ChallengeAttempt) => {
+    setError('')
+    setStarting(true)
+    try {
+      const config: SessionConfig = {
+        accountId: a.accountId,
+        accountName: a.accountName,
+        symbol: a.symbol,
+        startTs: a.resumeTs,
+        spread: a.spread,
+        commissionPerLot: a.commissionPerLot,
+        startingBalance: a.startingBalance,
+        rules: a.rules,
+        resume: { attemptId: a.id!, state: a.state },
+      }
+      onStart(await ReplayEngine.create(config))
+    } catch (e: any) {
+      setError(String(e.message || e))
+      setStarting(false)
+    }
+  }
+
+  const discard = async (a: ChallengeAttempt) => {
+    const m = summarizeAttempt(a)
+    const what = a.outcome === 'running'
+      ? `Discard the in-progress ${m.stageName} attempt (${fmtUsd(a.state.balance, 0)}, ${m.tradingDays} trading days)?`
+      : `Remove the ${a.outcome} ${m.stageName} attempt from history?`
+    if (!confirm(`${what} The trades it produced stay in the journal.`)) return
+    await deleteAttempt(a.id!)
+  }
+
+  const sorted = sortAttempts(attempts)
+
   return (
-    <div className="flex items-center justify-center h-full p-6">
-      <div className="card w-full max-w-md">
+    <div className={`flex justify-center gap-4 h-full p-6 ${sorted.length ? 'items-start overflow-y-auto' : 'items-center'}`}>
+      <div className="card w-full max-w-md shrink-0">
         <h1 className="text-lg font-semibold text-ink mb-1">New backtest session</h1>
         <p className="text-xs text-muted mb-4">1-min data · {range ? `${fmtMonth(range.from)} → ${fmtMonth(range.to)}` : '—'} · GMT · bid prices</p>
         <div className="space-y-3">
+          <RuleSetPicker value={sessionRules} onChange={pickRules} />
           <div>
             <label className="label">Instrument</label>
             <div className="flex gap-1.5">
@@ -207,11 +288,23 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
             </div>
             <div>
               <label className="label">Commission /lot</label>
-              <input type="number" step="0.5" min="0" className="input" value={commission} onChange={e => setCommission(+e.target.value)} />
+              <input
+                type="number" step="0.5" min="0" className="input disabled:opacity-50"
+                disabled={!!activeRuleSet}
+                title={activeRuleSet ? `Set by ${activeRuleSet.firm}` : undefined}
+                value={commission}
+                onChange={e => setCommission(+e.target.value)}
+              />
             </div>
             <div>
               <label className="label">Balance ($)</label>
-              <input type="number" step="100" min="1" className="input" value={balance} onChange={e => setBalance(+e.target.value)} />
+              <input
+                type="number" step="100" min="1" className="input disabled:opacity-50"
+                disabled={!!activeRuleSet}
+                title={activeRuleSet ? `Fixed by the ${activeRuleSet.name} account size` : undefined}
+                value={balance}
+                onChange={e => setBalance(+e.target.value)}
+              />
             </div>
           </div>
           {error && <div className="text-xs text-down">{error}</div>}
@@ -221,6 +314,15 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
           <p className="text-[11px] text-muted">Data is bid-priced: buys fill at bid + spread. If SL and TP are hit inside the same 1-min bar, SL wins (conservative).</p>
         </div>
       </div>
+      {sorted.length > 0 && (
+        <AttemptsPanel
+          attempts={sorted}
+          busy={starting}
+          hasData={sym => !!ranges[sym]}
+          onResume={a => void resume(a)}
+          onDelete={a => void discard(a)}
+        />
+      )}
     </div>
   )
 }
@@ -360,6 +462,12 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
     return () => { engine.onTradeClosed = null }
   }, [engine])
 
+  // A breach or a pass should stop the tape rather than roll straight past it.
+  useEffect(() => {
+    engine.onRuleEvent = () => setPlaying(false)
+    return () => { engine.onRuleEvent = null }
+  }, [engine])
+
   // playback loop
   useEffect(() => {
     if (!playing) return
@@ -387,6 +495,7 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
 
   const sessionPnl = engine.sessionTrades.reduce((s, t) => s + t.pnl, 0)
   const openPnl = engine.openPnlTotal()
+  const ruleStatus = engine.rules?.status() ?? null
 
   return (
     <div className="flex flex-col h-full">
@@ -410,6 +519,15 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
         </button>
         <button className="btn-ghost text-xs" onClick={() => { setPlaying(false); onEnd() }}>End session</button>
       </div>
+
+      {ruleStatus && <RulesHud status={ruleStatus} />}
+      {ruleStatus && (
+        <RuleBanner
+          status={ruleStatus}
+          onOverride={() => engine.overrideBreach()}
+          onEnd={() => { setPlaying(false); onEnd() }}
+        />
+      )}
 
       {/* shared controls: play/speed/pane count. Volume and indicators moved
           into each pane's own header so they can differ per chart. */}
@@ -550,6 +668,9 @@ function OrderTicket({ engine }: { engine: ReplayEngine }) {
   const [checked, setChecked] = useState<Record<string, boolean>>({})
   const [notes, setNotes] = useState('')
   const [error, setError] = useState('')
+  // A soft rule (per-idea risk, Friday cut-off) warns once, then lets you through.
+  const [warning, setWarning] = useState('')
+  const [pending, setPending] = useState<Direction | null>(null)
   const [addingSetup, setAddingSetup] = useState(false)
   const symbol = engine.config.symbol
   const spec = specFor(symbol)
@@ -568,19 +689,26 @@ function OrderTicket({ engine }: { engine: ReplayEngine }) {
     setTp((dir === 'long' ? entry + dist * r : entry - dist * r).toFixed(spec.decimals))
   }
 
-  const place = (direction: Direction) => {
+  const place = (direction: Direction, force = false) => {
     setError('')
+    if (!force) { setWarning(''); setPending(null) }
     const entry = direction === 'long' ? engine.ask : engine.bid
     if (!(lots > 0)) return setError('Lots must be > 0')
     if (slNum !== undefined && (direction === 'long' ? slNum >= entry : slNum <= entry)) return setError('SL must be on the losing side of entry')
     if (tpNum !== undefined && (direction === 'long' ? tpNum <= entry : tpNum >= entry)) return setError('TP must be on the winning side of entry')
+    const check = engine.checkOrder({ direction, lots, sl: slNum })
+    if (!check.ok) return setError(check.error ?? 'Blocked by the challenge rules')
+    if (check.warning && !force) { setWarning(check.warning); setPending(direction); return }
     const confirmations: Confirmation[] = (setup?.criteria ?? []).map(label => ({ label, checked: !!checked[label] }))
-    engine.placeMarketOrder({ direction, lots, sl: slNum, tp: tpNum, setupId: setupId || undefined, confirmations, notes })
+    const placed = engine.placeMarketOrder({ direction, lots, sl: slNum, tp: tpNum, setupId: setupId || undefined, confirmations, notes })
+    if (!placed.ok) return setError(placed.error ?? 'Blocked by the challenge rules')
     void setSetting('defaultLots', lots)
+    setWarning(''); setPending(null)
     setNotes(''); setChecked({}); setSl(''); setTp('')
   }
 
   const risk = (dir: Direction) => (slNum !== undefined ? riskUsd(dir, dir === 'long' ? engine.ask : engine.bid, slNum, lots, symbol) : undefined)
+  const halted = engine.rules?.outcome === 'failed' && !engine.rules.overridden
 
   return (
     <div className="card space-y-3">
@@ -656,9 +784,18 @@ function OrderTicket({ engine }: { engine: ReplayEngine }) {
         <textarea className="input min-h-[64px]" placeholder="Why are you taking this trade?" value={notes} onChange={e => setNotes(e.target.value)} />
       </div>
       {error && <div className="text-xs text-down">{error}</div>}
+      {warning && pending && (
+        <div className="rounded-lg border border-warn/40 bg-warn/10 p-2 space-y-2">
+          <div className="text-[11px] text-warn">{warning}</div>
+          <div className="flex gap-2">
+            <button className="btn-ghost text-xs flex-1" onClick={() => place(pending, true)}>Place anyway</button>
+            <button className="btn-ghost text-xs flex-1" onClick={() => { setWarning(''); setPending(null) }}>Cancel</button>
+          </div>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-2">
-        <button className="btn-up py-2.5 font-semibold" onClick={() => place('long')}>▲ BUY</button>
-        <button className="btn-down py-2.5 font-semibold" onClick={() => place('short')}>▼ SELL</button>
+        <button className="btn-up py-2.5 font-semibold disabled:opacity-40" disabled={halted} onClick={() => place('long')}>▲ BUY</button>
+        <button className="btn-down py-2.5 font-semibold disabled:opacity-40" disabled={halted} onClick={() => place('short')}>▼ SELL</button>
       </div>
     </div>
   )

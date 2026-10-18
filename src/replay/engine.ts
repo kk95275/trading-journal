@@ -5,7 +5,9 @@
 import type { Bar, Confirmation, Direction, ExitReason, Trade } from '../lib/types'
 import { pnlUsd, riskUsd } from '../lib/gold'
 import { specFor } from '../lib/symbols'
+import { RuleRuntime, marginUsdFor, ruleSetById, type OrderCheck, type RuleRuntimeState, type SessionRules } from '../lib/propRules'
 import * as data from '../data/dataService'
+import { AttemptStore, createAttempt } from './attemptStore'
 import type { Drawing } from './drawings'
 
 export interface SessionConfig {
@@ -16,7 +18,18 @@ export interface SessionConfig {
   spread: number
   commissionPerLot: number // round-turn, per lot
   startingBalance: number
+  /** Funded-challenge rule set to enforce. Absent = plain backtesting, no rules. */
+  rules?: SessionRules
+  /**
+   * Set when picking a saved attempt back up: the engine rebuilds the rule
+   * tracker from this state and keeps writing to the same row instead of
+   * opening a new attempt. Positions aren't carried — a resumed session starts
+   * flat on the realized balance.
+   */
+  resume?: { attemptId: number; state: RuleRuntimeState }
 }
+
+export type RuleEvent = 'breach' | 'passed'
 
 export interface OpenPosition {
   id: number
@@ -44,7 +57,12 @@ export class ReplayEngine {
   ended = false
   loadingMore = false
   drawings: Drawing[] = [] // chart drawings live on the session so they survive route changes
+  /** Null for a plain backtest; otherwise tracks the challenge and gates orders. */
+  rules: RuleRuntime | null = null
+  /** Null for a plain backtest; otherwise keeps the attempt's Dexie row in step. */
+  attempt: AttemptStore | null = null
   onTradeClosed: ((t: Trade) => void) | null = null
+  onRuleEvent: ((e: RuleEvent) => void) | null = null
 
   private nextChunkIdx = 0
   private totalChunks = 0
@@ -58,6 +76,15 @@ export class ReplayEngine {
 
   static async create(config: SessionConfig): Promise<ReplayEngine> {
     const eng = new ReplayEngine(config)
+    const rs = ruleSetById(config.rules?.ruleSetId)
+    if (rs && config.rules) {
+      eng.rules = config.resume
+        ? RuleRuntime.fromState(rs, config.rules, config.startingBalance, config.resume.state)
+        : new RuleRuntime(rs, config.rules.stageId, config.startingBalance, config.rules.overrides)
+      // A resumed attempt carries on from the balance it stopped at, while
+      // startingBalance stays the figure every rule limit is measured against.
+      if (config.resume) eng.balance = config.resume.state.balance
+    }
     const chunks = await data.chunksFor(config.symbol, '1m')
     eng.totalChunks = chunks.length
     const from = config.startTs - CONTEXT_DAYS * 86400
@@ -72,7 +99,37 @@ export class ReplayEngine {
     let i = bars.length - 1
     while (i > 0 && bars[i].time > config.startTs) i--
     eng.idx = Math.max(0, i)
+    // Prime the rule tracker on the starting bar so the day's baseline is the
+    // untouched starting balance, not whatever equity the first order leaves.
+    eng.syncRules(eng.currentBar.time)
+    if (eng.rules && config.rules) {
+      const snapshot = () => ({ resumeTs: eng.currentBar.time, state: eng.rules!.toJSON() })
+      const id = config.resume?.attemptId ?? await createAttempt({
+        accountId: config.accountId,
+        accountName: config.accountName,
+        symbol: config.symbol,
+        spread: config.spread,
+        commissionPerLot: config.commissionPerLot,
+        rules: config.rules,
+        startingBalance: config.startingBalance,
+        startTs: config.startTs,
+      }, snapshot())
+      eng.attempt = new AttemptStore(id, snapshot)
+    }
     return eng
+  }
+
+  /** Flush the attempt row so the resume point is current. Safe without rules. */
+  async endSession(): Promise<void> {
+    await this.attempt?.dispose()
+    this.attempt = null
+  }
+
+  /** Keep trading past a breach, for practice. The attempt stays failed. */
+  overrideBreach() {
+    this.rules?.override()
+    this.attempt?.touch(true)
+    this.notify()
   }
 
   subscribe(fn: () => void): () => void {
@@ -82,6 +139,11 @@ export class ReplayEngine {
 
   private notify() {
     for (const fn of this.listeners) fn()
+  }
+
+  /** Re-render subscribers after state changed outside the engine's own methods. */
+  touch() {
+    this.notify()
   }
 
   get currentBar(): Bar {
@@ -105,6 +167,63 @@ export class ReplayEngine {
     return this.positions.reduce((s, p) => s + this.openPnl(p), 0)
   }
 
+  get equity(): number {
+    return this.balance + this.openPnlTotal()
+  }
+
+  /** Margin in use across open positions, under the rule set's leverage tiers. */
+  marginUsedUsd(): number {
+    const r = this.rules
+    if (!r) return 0
+    return this.positions.reduce((s, p) => s + marginUsdFor(r.rules, this.config.symbol, p.lots, this.bid), 0)
+  }
+
+  /**
+   * Worst equity reached inside a bar — longs marked to its low, shorts to its
+   * high + spread. Prop firms measure drawdown continuously, so a wick through
+   * the floor is a breach even when the bar closes back above it.
+   */
+  private worstEquityIn(bar: Bar): number {
+    let eq = this.balance
+    for (const p of this.positions) {
+      const exit = p.direction === 'long' ? bar.low : bar.high + this.config.spread
+      eq += pnlUsd(p.direction, p.entryPrice, exit, p.lots, this.config.symbol) - this.config.commissionPerLot * p.lots
+    }
+    return eq
+  }
+
+  /**
+   * Feed the rule tracker. On a breach the firm disables the account, so we
+   * flatten at market the way it would, and refuse further orders until the
+   * trader explicitly chooses to keep going for practice.
+   */
+  private syncRules(ts: number, equityLow?: number) {
+    const r = this.rules
+    if (!r) return
+    const res = r.sync({
+      ts,
+      balance: this.balance,
+      equity: this.equity,
+      equityLow,
+      marginUsed: this.marginUsedUsd(),
+      openPositions: this.positions.length,
+    })
+    if (res === 'breach') {
+      for (const p of [...this.positions]) {
+        this.fillExit(p, p.direction === 'long' ? this.bid : this.ask, 'other', ts)
+      }
+      r.balance = this.balance
+      r.equity = this.balance
+      r.marginUsed = 0
+      this.onRuleEvent?.('breach')
+    } else if (res === 'passed') {
+      this.onRuleEvent?.('passed')
+    }
+    // Throttled on an ordinary minute; written straight away when the attempt
+    // reaches its verdict, since that's the row the history list reads.
+    this.attempt?.touch(res !== null)
+  }
+
   /** Advance one 1m bar; returns false at the end of loaded data. */
   private advanceOne(): boolean {
     if (this.idx >= this.oneMin.length - 1) return false
@@ -124,6 +243,7 @@ export class ReplayEngine {
         }
       }
     }
+    this.syncRules(bar.time, this.worstEquityIn(bar))
     this.maybePrefetch()
     return true
   }
@@ -142,6 +262,22 @@ export class ReplayEngine {
     return true
   }
 
+  /** Pre-trade rule check. Always ok when the session has no rule set. */
+  checkOrder(o: { direction: Direction; lots: number; sl?: number }): OrderCheck {
+    const r = this.rules
+    if (!r) return { ok: true }
+    return r.checkOrder({
+      symbol: this.config.symbol,
+      direction: o.direction,
+      lots: o.lots,
+      price: o.direction === 'long' ? this.ask : this.bid,
+      sl: o.sl,
+      equity: this.equity,
+      openDirections: this.positions.map(p => p.direction),
+      ts: this.currentBar.time,
+    })
+  }
+
   placeMarketOrder(o: {
     direction: Direction
     lots: number
@@ -150,7 +286,10 @@ export class ReplayEngine {
     setupId?: number
     confirmations: Confirmation[]
     notes: string
-  }) {
+  }): OrderCheck {
+    const check = this.checkOrder(o)
+    if (!check.ok) return check
+    if (check.riskFlag) this.rules?.noteRiskFlag()
     const entry = o.direction === 'long' ? this.ask : this.bid
     this.positions.push({
       id: this.posSeq++,
@@ -164,7 +303,11 @@ export class ReplayEngine {
       confirmations: o.confirmations,
       notes: o.notes,
     })
+    this.rules?.noteTradeOpened(this.currentBar.time)
+    this.syncRules(this.currentBar.time)
+    this.attempt?.touch(true)
     this.notify()
+    return check
   }
 
   modifyStops(id: number, sl?: number, tp?: number) {
@@ -185,6 +328,7 @@ export class ReplayEngine {
     if (!p) return
     const exit = p.direction === 'long' ? this.bid : this.ask
     this.fillExit(p, exit, 'manual', this.currentBar.time)
+    this.syncRules(this.currentBar.time)
     this.notify()
   }
 
@@ -219,8 +363,10 @@ export class ReplayEngine {
       tags: [],
     }
     this.balance = +(this.balance + pnl).toFixed(2)
+    this.rules?.noteTradeClosed(pnl)
     this.sessionTrades.push(trade)
     this.onTradeClosed?.(trade)
+    this.attempt?.touch(true)
   }
 
   private maybePrefetch() {

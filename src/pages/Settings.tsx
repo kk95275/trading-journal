@@ -39,6 +39,7 @@ export default function Settings() {
     const n = tradeCounts.get(id) ?? 0
     if (!confirm(`Delete account “${name}” and its ${n} trades permanently?`)) return
     await db.trades.where('accountId').equals(id).delete()
+    await db.challengeAttempts.where('accountId').equals(id).delete()
     await db.accounts.delete(id)
   }
 
@@ -101,7 +102,7 @@ export default function Settings() {
   const wipe = async () => {
     if (!confirm('Delete ALL accounts, trades, setups and journal entries? This cannot be undone.')) return
     if (!confirm('Really sure? Last chance.')) return
-    await Promise.all([db.accounts.clear(), db.trades.clear(), db.setups.clear(), db.journal.clear(), db.settings.clear()])
+    await Promise.all([db.accounts.clear(), db.trades.clear(), db.setups.clear(), db.journal.clear(), db.settings.clear(), db.challengeAttempts.clear()])
     setMsg('All data wiped.')
   }
 
