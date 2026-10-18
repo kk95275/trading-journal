@@ -69,34 +69,45 @@ export function getStrategyFiles(def: StrategyDef): { files: StrategyFile[]; mai
 }
 
 /**
- * One funded-challenge attempt, kept across replay sessions.
+ * One saved replay session, kept so it can be picked up again later.
  *
- * A real 2-step evaluation runs over weeks, so an attempt can't live only in the
- * in-memory ReplayEngine: this row is what lets a trader stop and pick the same
- * attempt back up. `state` is the serialised RuleRuntime; `resumeTs` is the bar
- * the replay should restart on. Rows only exist for sessions that have a rule
- * set — plain backtesting writes nothing here.
+ * Every backtest session gets a row, with or without a rule set: the in-memory
+ * ReplayEngine dies with the page, and a trader shouldn't lose a week of replay
+ * to a reload. `resumeTs` is the bar to restart on and `balance` is where the
+ * account stood there.
+ *
+ * `rules` and `state` are present only for funded-challenge attempts — `state`
+ * is the serialised RuleRuntime. A plain backtest leaves both null and simply
+ * stays resumable forever.
+ *
+ * The store is still named `challengeAttempts` because it shipped under that
+ * name in db v5; only the meaning widened.
  */
-export interface ChallengeAttempt {
+export interface BacktestSession {
   id?: number
   accountId: number
   accountName: string
   symbol: string
   spread: number
   commissionPerLot: number
-  rules: SessionRules
-  /** The stage's starting balance — every rule limit is measured off this. */
+  rules: SessionRules | null
+  /** The session's opening balance — every rule limit is measured off this. */
   startingBalance: number
-  /** Where the attempt originally began, for display. */
+  /** Where the session originally began, for display. */
   startTs: number
   /** Replay timestamp to resume from — the bar the session was last on. */
   resumeTs: number
-  state: RuleRuntimeState
-  /** Mirrors state.outcome so unfinished attempts can be indexed. */
+  /** Balance at resumeTs. Mirrors state.balance when there is a rule set. */
+  balance: number
+  state: RuleRuntimeState | null
+  /** Mirrors state.outcome, or 'running' for a plain session that never ends. */
   outcome: RuleOutcome
   createdAt: number
   updatedAt: number
 }
+
+/** Pre-widening alias, so older imports keep reading sensibly. */
+export type ChallengeAttempt = BacktestSession
 
 class TradingJournalDB extends Dexie {
   accounts!: Table<Account, number>
@@ -107,7 +118,7 @@ class TradingJournalDB extends Dexie {
   aiConversations!: Table<AIConversation, number>
   customIndicators!: Table<CustomIndicatorDef, number>
   strategies!: Table<StrategyDef, number>
-  challengeAttempts!: Table<ChallengeAttempt, number>
+  challengeAttempts!: Table<BacktestSession, number>
 
   constructor() {
     super('trading-journal')
@@ -129,6 +140,12 @@ class TradingJournalDB extends Dexie {
     })
     this.version(5).stores({
       challengeAttempts: '++id, accountId, outcome, updatedAt, [accountId+outcome]',
+    })
+    // Trades gained sessionId so a saved session's trades can be pulled back out
+    // and replayed against a rule set. Trades written before this have none, and
+    // fall back to matching on account plus the session's time span.
+    this.version(6).stores({
+      trades: '++id, accountId, entryTime, exitTime, setupId, symbol, direction, sessionId',
     })
   }
 }

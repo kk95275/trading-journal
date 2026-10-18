@@ -7,7 +7,7 @@ import { pnlUsd, riskUsd } from '../lib/gold'
 import { specFor } from '../lib/symbols'
 import { RuleRuntime, marginUsdFor, ruleSetById, type OrderCheck, type RuleRuntimeState, type SessionRules } from '../lib/propRules'
 import * as data from '../data/dataService'
-import { AttemptStore, createAttempt } from './attemptStore'
+import { SessionStore, createSession } from './sessionStore'
 import type { Drawing } from './drawings'
 
 export interface SessionConfig {
@@ -21,12 +21,12 @@ export interface SessionConfig {
   /** Funded-challenge rule set to enforce. Absent = plain backtesting, no rules. */
   rules?: SessionRules
   /**
-   * Set when picking a saved attempt back up: the engine rebuilds the rule
+   * Set when picking a saved session back up: the engine rebuilds the rule
    * tracker from this state and keeps writing to the same row instead of
    * opening a new attempt. Positions aren't carried — a resumed session starts
    * flat on the realized balance.
    */
-  resume?: { attemptId: number; state: RuleRuntimeState }
+  resume?: { sessionId: number; balance: number; state: RuleRuntimeState | null }
 }
 
 export type RuleEvent = 'breach' | 'passed'
@@ -59,8 +59,10 @@ export class ReplayEngine {
   drawings: Drawing[] = [] // chart drawings live on the session so they survive route changes
   /** Null for a plain backtest; otherwise tracks the challenge and gates orders. */
   rules: RuleRuntime | null = null
-  /** Null for a plain backtest; otherwise keeps the attempt's Dexie row in step. */
-  attempt: AttemptStore | null = null
+  /** Keeps this session's Dexie row in step so it can be resumed later. */
+  store: SessionStore | null = null
+  /** The saved session's row id, stamped onto every trade it produces. */
+  sessionId: number | null = null
   onTradeClosed: ((t: Trade) => void) | null = null
   onRuleEvent: ((e: RuleEvent) => void) | null = null
 
@@ -78,13 +80,15 @@ export class ReplayEngine {
     const eng = new ReplayEngine(config)
     const rs = ruleSetById(config.rules?.ruleSetId)
     if (rs && config.rules) {
-      eng.rules = config.resume
+      // A session saved without a rule set, then resumed with one, starts the
+      // challenge fresh rather than inventing state it never had.
+      eng.rules = config.resume?.state
         ? RuleRuntime.fromState(rs, config.rules, config.startingBalance, config.resume.state)
         : new RuleRuntime(rs, config.rules.stageId, config.startingBalance, config.rules.overrides)
-      // A resumed attempt carries on from the balance it stopped at, while
-      // startingBalance stays the figure every rule limit is measured against.
-      if (config.resume) eng.balance = config.resume.state.balance
     }
+    // A resumed session carries on from the balance it stopped at, while
+    // startingBalance stays the figure every rule limit is measured against.
+    if (config.resume) eng.balance = config.resume.balance
     const chunks = await data.chunksFor(config.symbol, '1m')
     eng.totalChunks = chunks.length
     const from = config.startTs - CONTEXT_DAYS * 86400
@@ -102,33 +106,36 @@ export class ReplayEngine {
     // Prime the rule tracker on the starting bar so the day's baseline is the
     // untouched starting balance, not whatever equity the first order leaves.
     eng.syncRules(eng.currentBar.time)
-    if (eng.rules && config.rules) {
-      const snapshot = () => ({ resumeTs: eng.currentBar.time, state: eng.rules!.toJSON() })
-      const id = config.resume?.attemptId ?? await createAttempt({
-        accountId: config.accountId,
-        accountName: config.accountName,
-        symbol: config.symbol,
-        spread: config.spread,
-        commissionPerLot: config.commissionPerLot,
-        rules: config.rules,
-        startingBalance: config.startingBalance,
-        startTs: config.startTs,
-      }, snapshot())
-      eng.attempt = new AttemptStore(id, snapshot)
-    }
+    const snapshot = () => ({
+      resumeTs: eng.currentBar.time,
+      balance: eng.balance,
+      state: eng.rules ? eng.rules.toJSON() : null,
+    })
+    const id = config.resume?.sessionId ?? await createSession({
+      accountId: config.accountId,
+      accountName: config.accountName,
+      symbol: config.symbol,
+      spread: config.spread,
+      commissionPerLot: config.commissionPerLot,
+      rules: config.rules ?? null,
+      startingBalance: config.startingBalance,
+      startTs: config.startTs,
+    }, snapshot())
+    eng.sessionId = id
+    eng.store = new SessionStore(id, snapshot)
     return eng
   }
 
-  /** Flush the attempt row so the resume point is current. Safe without rules. */
+  /** Flush the session row so the resume point is current. */
   async endSession(): Promise<void> {
-    await this.attempt?.dispose()
-    this.attempt = null
+    await this.store?.dispose()
+    this.store = null
   }
 
   /** Keep trading past a breach, for practice. The attempt stays failed. */
   overrideBreach() {
     this.rules?.override()
-    this.attempt?.touch(true)
+    this.store?.touch(true)
     this.notify()
   }
 
@@ -219,9 +226,9 @@ export class ReplayEngine {
     } else if (res === 'passed') {
       this.onRuleEvent?.('passed')
     }
-    // Throttled on an ordinary minute; written straight away when the attempt
+    // Throttled on an ordinary minute; written straight away when the session
     // reaches its verdict, since that's the row the history list reads.
-    this.attempt?.touch(res !== null)
+    this.store?.touch(res !== null)
   }
 
   /** Advance one 1m bar; returns false at the end of loaded data. */
@@ -305,7 +312,7 @@ export class ReplayEngine {
     })
     this.rules?.noteTradeOpened(this.currentBar.time)
     this.syncRules(this.currentBar.time)
-    this.attempt?.touch(true)
+    this.store?.touch(true)
     this.notify()
     return check
   }
@@ -366,7 +373,7 @@ export class ReplayEngine {
     this.rules?.noteTradeClosed(pnl)
     this.sessionTrades.push(trade)
     this.onTradeClosed?.(trade)
-    this.attempt?.touch(true)
+    this.store?.touch(true)
   }
 
   private maybePrefetch() {

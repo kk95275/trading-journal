@@ -27,6 +27,8 @@ export interface Confirmation {
 export interface Trade {
   id?: number
   accountId: number
+  /** The replay session that produced it. Absent on trades from before db v6. */
+  sessionId?: number
   symbol: string
   direction: Direction
   lots: number
