@@ -1,5 +1,6 @@
 import Dexie, { type Table } from 'dexie'
 import type { Account, Trade, Setup, JournalEntry } from './lib/types'
+import type { RuleOutcome, RuleRuntimeState, SessionRules } from './lib/propRules'
 
 export interface SettingRow {
   key: string
@@ -67,6 +68,36 @@ export function getStrategyFiles(def: StrategyDef): { files: StrategyFile[]; mai
   return { files: raw, mainFile }
 }
 
+/**
+ * One funded-challenge attempt, kept across replay sessions.
+ *
+ * A real 2-step evaluation runs over weeks, so an attempt can't live only in the
+ * in-memory ReplayEngine: this row is what lets a trader stop and pick the same
+ * attempt back up. `state` is the serialised RuleRuntime; `resumeTs` is the bar
+ * the replay should restart on. Rows only exist for sessions that have a rule
+ * set — plain backtesting writes nothing here.
+ */
+export interface ChallengeAttempt {
+  id?: number
+  accountId: number
+  accountName: string
+  symbol: string
+  spread: number
+  commissionPerLot: number
+  rules: SessionRules
+  /** The stage's starting balance — every rule limit is measured off this. */
+  startingBalance: number
+  /** Where the attempt originally began, for display. */
+  startTs: number
+  /** Replay timestamp to resume from — the bar the session was last on. */
+  resumeTs: number
+  state: RuleRuntimeState
+  /** Mirrors state.outcome so unfinished attempts can be indexed. */
+  outcome: RuleOutcome
+  createdAt: number
+  updatedAt: number
+}
+
 class TradingJournalDB extends Dexie {
   accounts!: Table<Account, number>
   trades!: Table<Trade, number>
@@ -76,6 +107,7 @@ class TradingJournalDB extends Dexie {
   aiConversations!: Table<AIConversation, number>
   customIndicators!: Table<CustomIndicatorDef, number>
   strategies!: Table<StrategyDef, number>
+  challengeAttempts!: Table<ChallengeAttempt, number>
 
   constructor() {
     super('trading-journal')
@@ -94,6 +126,9 @@ class TradingJournalDB extends Dexie {
     })
     this.version(4).stores({
       strategies: '++id, name, symbol, updatedAt',
+    })
+    this.version(5).stores({
+      challengeAttempts: '++id, accountId, outcome, updatedAt, [accountId+outcome]',
     })
   }
 }
