@@ -1,23 +1,53 @@
-// TradingView-style drawing overlay for the replay chart.
-// Rendering: a pointer-events-none canvas above the chart. Interaction: capture-phase
-// pointer listeners on the chart container — when a tool is active or a drawing is hit,
-// the event is consumed (stopPropagation) so the chart doesn't pan underneath.
+// Drawing layer over the replay chart: a canvas for the drawings themselves, a
+// tool rail, and the pointer/keyboard handling that makes them feel like a real
+// charting package — eight-handle rectangles, hover affordances, resize cursors,
+// undo/redo, a right-click menu and per-drawing styling.
+//
+// Geometry and the handle model live in src/replay/drawings.ts so the renderer,
+// the hit test and the drag logic all read from one definition.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { IChartApi, ISeriesApi, Logical } from 'lightweight-charts'
 import type { Bar } from '../lib/types'
 import type { IReplayView } from '../replay/engine'
 import { getSetting, setSetting } from '../db'
+import { fmtPx } from '../lib/symbols'
 import {
-  DRAW_COLORS, distToSegment, nearestIndex, nextDrawingId,
-  type Anchor, type Drawing, type TextH, type TextV, type Tool,
+  DRAW_COLORS, FIB_LEVELS, KIND_LABEL, LINE_STYLES, LINE_WIDTHS, TWO_POINT,
+  cloneDrawings, constrain, dashFor, distToSegment, extendSegment, geomOf, handlesFor,
+  nearestIndex, nextDrawingId, resizeByPart,
+  type Anchor, type DrawKind, type Drawing, type Geom, type HandlePart, type HitPart,
+  type LineStyle, type TextH, type TextV, type Tool,
 } from '../replay/drawings'
 
-// TradingView-style magnet. off = free cursor. weak = snap only when the
-// cursor is within WEAK_MAGNET_PX of an OHLC line. strong = always snap to
-// the nearest of the bar's four prices. Persisted across sessions.
 type MagnetMode = 'off' | 'weak' | 'strong'
 const WEAK_MAGNET_PX = 20
 const MAGNET_STORAGE_KEY = 'drawingMagnetMode'
+const STAY_STORAGE_KEY = 'drawingStayInTool'
+const HIT = 7
+const HANDLE_HIT = 8
+const MAX_UNDO = 100
+
+/**
+ * The chart library writes its own `style.cursor` on the container after our
+ * capture-phase handler runs, so an inline cursor never survives. A class with
+ * Tailwind's important modifier does. Spelled out as literals so the Tailwind
+ * scanner emits them.
+ */
+const CURSOR_CLASS: Record<HitPart, string> = {
+  body: '!cursor-move',
+  mid: '!cursor-move',
+  a: '!cursor-pointer',
+  b: '!cursor-pointer',
+  n: '!cursor-ns-resize',
+  s: '!cursor-ns-resize',
+  e: '!cursor-ew-resize',
+  w: '!cursor-ew-resize',
+  nw: '!cursor-nwse-resize',
+  se: '!cursor-nwse-resize',
+  ne: '!cursor-nesw-resize',
+  sw: '!cursor-nesw-resize',
+}
+const ALL_CURSOR_CLASSES = Object.values(CURSOR_CLASS)
 
 interface Props {
   container: HTMLElement
@@ -30,47 +60,86 @@ interface Props {
 }
 
 type DragState =
-  | { mode: 'move'; id: number; startX: number; startY: number; origA: Anchor; origB?: Anchor }
-  | { mode: 'a' | 'b'; id: number }
-  | { mode: 'left' | 'right'; id: number } // rect side-edge drag: moves the anchor sitting on that side
+  | { mode: 'move'; id: number; startX: number; startY: number; origA: Anchor; origB?: Anchor; moved: boolean }
+  | { mode: 'handle'; id: number; part: HandlePart; moved: boolean }
 
 interface Editing {
   x: number
   y: number
-  id?: number // existing drawing → edit its text
-  anchor?: Anchor // new text note
+  id?: number
+  anchor?: Anchor
   value: string
 }
 
-const HIT = 7
+interface Menu {
+  x: number
+  y: number
+  id: number
+}
 
 export default function DrawingLayer({ container, chart, series, engine, getBars, dataVersion, onCanvas }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<HTMLTextAreaElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
   const [tool, setTool] = useState<Tool>('cursor')
   const [color, setColor] = useState(DRAW_COLORS[0])
+  const [width, setWidth] = useState(1)
+  const [style, setStyle] = useState<LineStyle>('solid')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [editing, setEditing] = useState<Editing | null>(null)
+  const [menu, setMenu] = useState<Menu | null>(null)
+  const [showSettings, setShowSettings] = useState(false)
   const [magnet, setMagnet] = useState<MagnetMode>('off')
+  const [stayInTool, setStayInTool] = useState(false)
+  const [, setTick] = useState(0)
+
   const pendingRef = useRef<{ a: Anchor; hover: Anchor | null } | null>(null)
   const dragRef = useRef<DragState | null>(null)
+  const dragSnapRef = useRef<Drawing[] | null>(null)
+  const hoverRef = useRef<{ id: number; part: HitPart } | null>(null)
+  const shiftRef = useRef(false)
+  const undoRef = useRef<Drawing[][]>([])
+  const redoRef = useRef<Drawing[][]>([])
+  const clipboardRef = useRef<Drawing | null>(null)
+
   const toolRef = useRef(tool)
   const colorRef = useRef(color)
+  const widthRef = useRef(width)
+  const styleRef = useRef(style)
   const selRef = useRef(selectedId)
   const magnetRef = useRef(magnet)
+  const stayRef = useRef(stayInTool)
   toolRef.current = tool
   colorRef.current = color
+  widthRef.current = width
+  styleRef.current = style
   selRef.current = selectedId
   magnetRef.current = magnet
+  stayRef.current = stayInTool
 
-  // Persist magnet mode. Read once on mount; write on every change.
+  const selected = engine.drawings.find(d => d.id === selectedId) ?? null
+
   useEffect(() => {
     void getSetting<MagnetMode>(MAGNET_STORAGE_KEY, 'off').then(m => {
       if (m === 'off' || m === 'weak' || m === 'strong') setMagnet(m)
     })
+    void getSetting<boolean>(STAY_STORAGE_KEY, false).then(setStayInTool)
   }, [])
   useEffect(() => { void setSetting(MAGNET_STORAGE_KEY, magnet) }, [magnet])
+  useEffect(() => { void setSetting(STAY_STORAGE_KEY, stayInTool) }, [stayInTool])
+
+  /* ---------- history ---------- */
+
+  const snapshot = useCallback(() => cloneDrawings(engine.drawings), [engine])
+
+  /** Record the state *before* a change. Call it immediately prior to mutating. */
+  const commit = useCallback(() => {
+    undoRef.current.push(snapshot())
+    if (undoRef.current.length > MAX_UNDO) undoRef.current.shift()
+    redoRef.current.length = 0
+    setTick(t => t + 1) // the undo/redo buttons read the stacks
+  }, [snapshot])
 
   /* ---------- coordinate mapping ---------- */
 
@@ -100,24 +169,21 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
   }, [chart, series, getBars])
 
   /**
-   * TradingView-style magnet: when the mouse is near a candle's O/H/L/C, force
-   * the anchor's price to that exact value. `weak` snaps only if the cursor Y
-   * is within WEAK_MAGNET_PX of one of the four price lines; `strong` always
-   * snaps to whichever of the four is closest. Time is left alone — it's
-   * already snapped to the candle's index by pointToAnchor.
+   * Magnet: when the mouse is near a candle's O/H/L/C, force the anchor's price
+   * to that exact value. `weak` snaps only within WEAK_MAGNET_PX of a price
+   * line; `strong` always snaps to the closest of the four. Time is already
+   * snapped to the candle index by pointToAnchor.
    */
   const snapAnchor = useCallback((x: number, y: number, a: Anchor): Anchor => {
     const mode = magnetRef.current
     if (mode === 'off') return a
     const bars = getBars()
     if (!bars.length) return a
-    const idx = nearestIndex(bars, a.time)
-    const bar = bars[idx]
+    const bar = bars[nearestIndex(bars, a.time)]
     if (!bar) return a
-    const options = [bar.high, bar.low, bar.open, bar.close]
-    let bestPrice = options[0]
+    let bestPrice = bar.high
     let bestDistPx = Infinity
-    for (const p of options) {
+    for (const p of [bar.high, bar.low, bar.open, bar.close]) {
       const py = series.priceToCoordinate(p)
       if (py === null) continue
       const dPx = Math.abs(py - y)
@@ -131,6 +197,19 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     const a = pointToAnchor(x, y)
     return a ? snapAnchor(x, y, a) : null
   }, [pointToAnchor, snapAnchor])
+
+  /** Resolve a drawing to pixels. Null when it can't be placed on screen. */
+  const geomFor = useCallback((d: Drawing, paneW: number, paneH: number): Geom | null => {
+    const xa = timeToX(d.a.time), ya = priceToY(d.a.price)
+    if (d.kind === 'hline') return ya === null ? null : geomOf(d, 0, ya, null, null, paneW, paneH)
+    if (xa === null) return null
+    if (d.kind === 'vline') return geomOf(d, xa, 0, null, null, paneW, paneH)
+    if (ya === null) return null
+    if (!d.b) return geomOf(d, xa, ya, null, null, paneW, paneH)
+    const xb = timeToX(d.b.time), yb = priceToY(d.b.price)
+    if (xb === null || yb === null) return null
+    return geomOf(d, xa, ya, xb, yb, paneW, paneH)
+  }, [timeToX, priceToY])
 
   /* ---------- rendering ---------- */
 
@@ -154,200 +233,351 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     ctx.rect(0, 0, paneW, paneH)
     ctx.clip()
 
-    const drawOne = (d: Drawing, selected: boolean) => {
-      const xa = timeToX(d.a.time), ya = priceToY(d.a.price)
+    const symbol = engine.config.symbol
+    const hover = hoverRef.current
+
+    const drawOne = (d: Drawing, isSelected: boolean, preview = false) => {
+      const g = geomFor(d, paneW, paneH)
+      if (!g) return
+      const lw = d.width ?? 1
+      const hovered = !preview && hover?.id === d.id
       ctx.strokeStyle = d.color
       ctx.fillStyle = d.color
-      ctx.lineWidth = 1.5
+      ctx.lineWidth = lw
+      ctx.setLineDash(preview ? [4, 3] : dashFor(d.style, lw))
       ctx.font = '11px system-ui, sans-serif'
       ctx.textBaseline = 'top'
-      if (d.kind === 'hline') {
-        if (ya === null) return
-        ctx.beginPath()
-        ctx.moveTo(0, ya)
-        ctx.lineTo(paneW, ya)
-        ctx.stroke()
-        if (d.text) {
-          const tx = d.textH === 'center' ? paneW / 2 : d.textH === 'right' ? paneW - 6 : 6
-          const ty = d.textV === 'middle' ? ya - 6 : d.textV === 'bottom' ? ya + 4 : ya - 15
-          ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
-          drawText(ctx, d.text, tx, ty)
-          ctx.textAlign = 'left'
+      // A hovered-but-unselected drawing gets a faint halo, so you can tell what
+      // you're about to grab before you click. The halo pass strokes outlines
+      // only — fills and labels would otherwise be drawn twice.
+      const haloPass = hovered && !isSelected
+      let halo = false
+
+      const strokeBody = () => {
+        switch (d.kind) {
+          case 'hline':
+            ctx.beginPath(); ctx.moveTo(0, g.ya); ctx.lineTo(paneW, g.ya); ctx.stroke(); break
+          case 'vline':
+            ctx.beginPath(); ctx.moveTo(g.xa, 0); ctx.lineTo(g.xa, paneH); ctx.stroke(); break
+          case 'trend': case 'ray': case 'extended': {
+            if (g.xb === null || g.yb === null) break
+            const [x1, y1, x2, y2] = extendSegment(d.kind, g.xa, g.ya, g.xb, g.yb, paneW, paneH)
+            ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); break
+          }
+          case 'rect': {
+            if (g.xb === null || g.yb === null) break
+            const rw = g.xRight - g.xLeft, rh = g.yBottom - g.yTop
+            if (!halo) {
+              ctx.save()
+              ctx.globalAlpha = d.fillOpacity ?? 0.13
+              ctx.setLineDash([])
+              ctx.fillRect(g.xLeft, g.yTop, rw, rh)
+              ctx.restore()
+            }
+            ctx.strokeRect(g.xLeft, g.yTop, rw, rh)
+            break
+          }
+          case 'fib': {
+            if (g.xb === null || g.yb === null) break
+            const x1 = Math.min(g.xa, g.xb)
+            const x2 = paneW
+            const lo = d.a.price, hi = d.b!.price
+            let prevY: number | null = null
+            for (const lvl of FIB_LEVELS) {
+              const price = lo + (hi - lo) * lvl
+              const y = priceToY(price)
+              if (y === null) continue
+              if (prevY !== null && !halo) {
+                ctx.save()
+                ctx.globalAlpha = (d.fillOpacity ?? 0.13) * 0.5
+                ctx.setLineDash([])
+                ctx.fillRect(x1, Math.min(prevY, y), x2 - x1, Math.abs(y - prevY))
+                ctx.restore()
+              }
+              prevY = y
+              ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke()
+              if (!preview && !halo) {
+                ctx.save()
+                ctx.setLineDash([])
+                ctx.textAlign = 'left'
+                drawText(ctx, `${lvl.toFixed(3)}  ${fmtPx(price, symbol)}`, x1 + 4, y - 13)
+                ctx.restore()
+              }
+            }
+            // The leg itself, dashed, so the retracement's direction reads.
+            ctx.save()
+            ctx.setLineDash([3, 3])
+            ctx.globalAlpha = 0.6
+            ctx.beginPath(); ctx.moveTo(g.xa, g.ya); ctx.lineTo(g.xb, g.yb); ctx.stroke()
+            ctx.restore()
+            break
+          }
+          case 'text':
+            ctx.beginPath(); ctx.arc(g.xa, g.ya, 2, 0, Math.PI * 2); ctx.fill()
+            break
         }
-        if (selected) handle(ctx, paneW / 2, ya, d.color)
-        return
       }
-      if (xa === null || ya === null) return
+
+      if (haloPass) {
+        halo = true
+        ctx.save()
+        ctx.globalAlpha = 0.25
+        ctx.lineWidth = lw + 6
+        strokeBody()
+        ctx.restore()
+        halo = false
+      }
+      strokeBody()
+      ctx.setLineDash([])
+
+      // text label
       if (d.kind === 'text') {
-        ctx.beginPath()
-        ctx.arc(xa, ya, 2, 0, Math.PI * 2)
-        ctx.fill()
-        drawText(ctx, d.text || '…', xa + 5, ya - 6)
-        if (selected) handle(ctx, xa, ya, d.color)
-        return
+        drawText(ctx, d.text || '…', g.xa + 5, g.ya - 6)
+      } else if (d.text) {
+        placeLabel(ctx, d, g, paneW)
       }
-      const xb = d.b ? timeToX(d.b.time) : null
-      const yb = d.b ? priceToY(d.b.price) : null
-      if (xb === null || yb === null) return
-      if (d.kind === 'trend') {
-        ctx.lineWidth = 2
-        ctx.beginPath()
-        ctx.moveTo(xa, ya)
-        ctx.lineTo(xb, yb)
-        ctx.stroke()
-        if (d.text) {
-          // position along the line (left = start point, right = end point)
-          const [sx, sy] = xa <= xb ? [xa, ya] : [xb, yb]
-          const [ex, ey] = xa <= xb ? [xb, yb] : [xa, ya]
-          const tx = d.textH === 'center' ? (sx + ex) / 2 : d.textH === 'right' ? ex : sx
-          const anchorY = d.textH === 'center' ? (sy + ey) / 2 : d.textH === 'right' ? ey : sy
-          const lines = d.text.split('\n').length
-          const ty = d.textV === 'middle' ? anchorY - 6 : d.textV === 'bottom' ? anchorY + 8 : anchorY - 6 - lines * 14
-          ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
-          drawText(ctx, d.text, tx, ty)
-          ctx.textAlign = 'left'
+
+      if (isSelected && !preview) {
+        for (const hp of handlesFor(d, g)) {
+          handleDot(ctx, hp.x, hp.y, d.color, hover?.part === hp.part && hover.id === d.id)
         }
-      } else {
-        // Rect: extend flags override the horizontal edges to pane boundaries.
-        const anchorLeftX = Math.min(xa, xb), anchorRightX = Math.max(xa, xb)
-        const xLeft = d.extendLeft ? 0 : anchorLeftX
-        const xRight = d.extendRight ? paneW : anchorRightX
-        const y = Math.min(ya, yb)
-        const rw = xRight - xLeft, rh = Math.abs(yb - ya)
-        ctx.globalAlpha = 0.13
-        ctx.fillRect(xLeft, y, rw, rh)
-        ctx.globalAlpha = 1
-        ctx.strokeRect(xLeft, y, rw, rh)
-        if (d.text) {
-          const lines = d.text.split('\n').length
-          const tx = d.textH === 'center' ? xLeft + rw / 2 : d.textH === 'right' ? xLeft + rw - 5 : xLeft + 5
-          const ty = d.textV === 'middle' ? y + rh / 2 - (lines * 14) / 2 + 2 : d.textV === 'bottom' ? y + rh - lines * 14 - 3 : y + 4
-          ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
-          drawText(ctx, d.text, tx, ty, rw - 10)
-          ctx.textAlign = 'left'
-        }
-        if (selected) {
-          // Corner handles at the actual anchor positions (not the extended edges).
-          handle(ctx, xa, ya, d.color)
-          handle(ctx, xb, yb, d.color)
-          // Side handles: mid-edge circles for extending / dragging horizontally.
-          const midY = (ya + yb) / 2
-          handle(ctx, xLeft, midY, d.color, !!d.extendLeft)
-          handle(ctx, xRight, midY, d.color, !!d.extendRight)
-          return
-        }
-        return
-      }
-      if (selected) {
-        handle(ctx, xa, ya, d.color)
-        handle(ctx, xb, yb, d.color)
       }
     }
 
     for (const d of engine.drawings) drawOne(d, d.id === selRef.current)
 
-    // in-progress preview
+    // in-progress preview plus a live readout of what you're drawing
     const pending = pendingRef.current
     if (pending?.hover) {
-      const kind = toolRef.current
-      if (kind === 'trend' || kind === 'rect') {
-        ctx.setLineDash([4, 3])
-        drawOne({ id: -1, kind, a: pending.a, b: pending.hover, color: colorRef.current }, false)
-        ctx.setLineDash([])
+      const kind = toolRef.current as DrawKind
+      if (TWO_POINT.includes(kind)) {
+        const ghost: Drawing = {
+          id: -1, kind, a: pending.a, b: pending.hover,
+          color: colorRef.current, width: widthRef.current, style: styleRef.current,
+        }
+        drawOne(ghost, false, true)
+        drawReadout(ctx, ghost, paneW, paneH)
       }
     }
     ctx.restore()
-  }, [chart, container, engine, timeToX, priceToY])
 
-  /* ---------- hit testing (pixel space) ---------- */
+    /** Δ price / % / bar count next to the cursor while dragging out a shape. */
+    function drawReadout(c: CanvasRenderingContext2D, d: Drawing, pw: number, ph: number) {
+      if (!d.b) return
+      const g = geomFor(d, pw, ph)
+      if (!g || g.xb === null || g.yb === null) return
+      const bars = getBars()
+      const nBars = Math.abs(nearestIndex(bars, d.b.time) - nearestIndex(bars, d.a.time))
+      const dPrice = d.b.price - d.a.price
+      const pct = d.a.price ? (dPrice / d.a.price) * 100 : 0
+      const lines = [
+        `${dPrice >= 0 ? '+' : ''}${fmtPx(dPrice, symbol)}  (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`,
+        `${nBars} bar${nBars === 1 ? '' : 's'}`,
+      ]
+      c.save()
+      c.font = '11px system-ui, sans-serif'
+      c.textBaseline = 'top'
+      c.textAlign = 'left'
+      const wText = Math.max(...lines.map(l => c.measureText(l).width))
+      let bx = g.xb + 12, by = g.yb + 12
+      if (bx + wText + 10 > pw) bx = g.xb - wText - 22
+      if (by + 32 > ph) by = g.yb - 42
+      c.fillStyle = 'rgba(14,16,20,0.92)'
+      c.strokeStyle = 'rgba(255,255,255,0.14)'
+      c.lineWidth = 1
+      roundRect(c, bx - 6, by - 5, wText + 14, 32, 4)
+      c.fill(); c.stroke()
+      c.fillStyle = '#e8e6df'
+      lines.forEach((l, i) => c.fillText(l, bx, by + i * 14))
+      c.restore()
+    }
+  }, [chart, container, engine, geomFor, priceToY, getBars])
 
-  const hitTest = useCallback((x: number, y: number): { d: Drawing; part: 'a' | 'b' | 'body' | 'left' | 'right' } | null => {
+  /* ---------- hit testing ---------- */
+
+  const hitTest = useCallback((x: number, y: number): { d: Drawing; part: HitPart } | null => {
     const ds = engine.drawings
-    const paneW = chart.timeScale().width()
+    const ts = chart.timeScale()
+    const paneW = ts.width()
+    const paneH = container.clientHeight - ts.height()
     for (let i = ds.length - 1; i >= 0; i--) {
       const d = ds[i]
-      const xa = timeToX(d.a.time), ya = priceToY(d.a.price)
-      const xb = d.b ? timeToX(d.b.time) : null
-      const yb = d.b ? priceToY(d.b.price) : null
-      if (d.id === selRef.current && xa !== null && ya !== null) {
-        // Rect side handles first — they sit at pane edges when extended and
-        // should intercept before the underlying border hit.
-        if (d.kind === 'rect' && xb !== null && yb !== null) {
-          const anchorLeftX = Math.min(xa, xb), anchorRightX = Math.max(xa, xb)
-          const xLeft = d.extendLeft ? 0 : anchorLeftX
-          const xRight = d.extendRight ? paneW : anchorRightX
-          const midY = (ya + yb) / 2
-          if (Math.hypot(x - xLeft, y - midY) < HIT) return { d, part: 'left' }
-          if (Math.hypot(x - xRight, y - midY) < HIT) return { d, part: 'right' }
+      if (d.locked) continue
+      const g = geomFor(d, paneW, paneH)
+      if (!g) continue
+      // Handles win over the body, but only while the drawing is selected —
+      // otherwise invisible handles would steal clicks from what's underneath.
+      if (d.id === selRef.current) {
+        for (const hp of handlesFor(d, g)) {
+          if (Math.hypot(x - hp.x, y - hp.y) < HANDLE_HIT) return { d, part: hp.part }
         }
-        if (Math.hypot(x - xa, y - ya) < HIT) return { d, part: 'a' }
-        if (xb !== null && yb !== null && Math.hypot(x - xb, y - yb) < HIT) return { d, part: 'b' }
       }
-      if (d.kind === 'hline') {
-        if (ya !== null && Math.abs(y - ya) < HIT) return { d, part: 'body' }
-      } else if (d.kind === 'text') {
-        if (xa !== null && ya !== null && x > xa - HIT && x < xa + 90 && y > ya - HIT && y < ya + 16) return { d, part: 'body' }
-      } else if (xa !== null && ya !== null && xb !== null && yb !== null) {
-        if (d.kind === 'trend') {
-          if (distToSegment(x, y, xa, ya, xb, yb) < HIT) return { d, part: 'body' }
-        } else {
-          const anchorLeftX = Math.min(xa, xb), anchorRightX = Math.max(xa, xb)
-          const x1 = d.extendLeft ? 0 : anchorLeftX
-          const x2 = d.extendRight ? paneW : anchorRightX
-          const y1 = Math.min(ya, yb), y2 = Math.max(ya, yb)
+      switch (d.kind) {
+        case 'hline':
+          if (Math.abs(y - g.ya) < HIT) return { d, part: 'body' }
+          break
+        case 'vline':
+          if (Math.abs(x - g.xa) < HIT) return { d, part: 'body' }
+          break
+        case 'text':
+          if (x > g.xa - HIT && x < g.xa + 90 && y > g.ya - HIT && y < g.ya + 16) return { d, part: 'body' }
+          break
+        case 'trend': case 'ray': case 'extended': {
+          if (g.xb === null || g.yb === null) break
+          const [x1, y1, x2, y2] = extendSegment(d.kind, g.xa, g.ya, g.xb, g.yb, paneW, paneH)
+          if (distToSegment(x, y, x1, y1, x2, y2) < HIT) return { d, part: 'body' }
+          break
+        }
+        case 'fib': {
+          if (g.xb === null || g.yb === null) break
+          const lo = d.a.price, hi = d.b!.price
+          const x1 = Math.min(g.xa, g.xb)
+          if (x < x1 - HIT) break
+          for (const lvl of FIB_LEVELS) {
+            const py = priceToY(lo + (hi - lo) * lvl)
+            if (py !== null && Math.abs(y - py) < HIT) return { d, part: 'body' }
+          }
+          break
+        }
+        case 'rect': {
+          if (g.xb === null || g.yb === null) break
+          const { xLeft: x1, xRight: x2, yTop: y1, yBottom: y2 } = g
           const onBorder =
-            (Math.abs(x - x1) < HIT || Math.abs(x - x2) < HIT) && y > y1 - HIT && y < y2 + HIT ||
-            (Math.abs(y - y1) < HIT || Math.abs(y - y2) < HIT) && x > x1 - HIT && x < x2 + HIT
-          const inside = x > x1 && x < x2 && y > y1 && y < y2
-          if (onBorder || inside) return { d, part: 'body' }
+            ((Math.abs(x - x1) < HIT || Math.abs(x - x2) < HIT) && y > y1 - HIT && y < y2 + HIT) ||
+            ((Math.abs(y - y1) < HIT || Math.abs(y - y2) < HIT) && x > x1 - HIT && x < x2 + HIT)
+          if (onBorder || (x > x1 && x < x2 && y > y1 && y < y2)) return { d, part: 'body' }
+          break
         }
       }
     }
     return null
-  }, [engine, chart, timeToX, priceToY])
+  }, [engine, chart, container, geomFor, priceToY])
+
+  /* ---------- mutations ---------- */
+
+  const removeDrawing = useCallback((id: number) => {
+    commit()
+    engine.drawings = engine.drawings.filter(d => d.id !== id)
+    if (selRef.current === id) setSelectedId(null)
+    setMenu(null)
+    redraw()
+  }, [commit, engine, redraw])
+
+  const duplicateDrawing = useCallback((id: number) => {
+    const src = engine.drawings.find(d => d.id === id)
+    if (!src) return
+    commit()
+    const bars = getBars()
+    const shift = (a: Anchor): Anchor => {
+      const idx = Math.min(bars.length - 1, nearestIndex(bars, a.time) + 2)
+      return { time: bars.length ? bars[idx].time : a.time, price: a.price }
+    }
+    const copy: Drawing = {
+      ...src, id: nextDrawingId(),
+      a: shift(src.a), b: src.b ? shift(src.b) : undefined,
+    }
+    engine.drawings.push(copy)
+    setSelectedId(copy.id)
+    setMenu(null)
+    redraw()
+  }, [commit, engine, getBars, redraw])
+
+  const patchSelected = useCallback((patch: Partial<Drawing>) => {
+    const id = selRef.current
+    if (id === null) return
+    const d = engine.drawings.find(x => x.id === id)
+    if (!d) return
+    commit()
+    Object.assign(d, patch)
+    setTick(t => t + 1)
+    redraw()
+  }, [commit, engine, redraw])
+
+  const reorder = useCallback((id: number, toFront: boolean) => {
+    const i = engine.drawings.findIndex(d => d.id === id)
+    if (i < 0) return
+    commit()
+    const [d] = engine.drawings.splice(i, 1)
+    if (toFront) engine.drawings.push(d)
+    else engine.drawings.unshift(d)
+    setMenu(null)
+    redraw()
+  }, [commit, engine, redraw])
+
+  const undo = useCallback(() => {
+    if (!undoRef.current.length) return
+    redoRef.current.push(snapshot())
+    engine.drawings = undoRef.current.pop()!
+    setSelectedId(null)
+    setTick(t => t + 1)
+    redraw()
+  }, [engine, redraw, snapshot])
+
+  const redo = useCallback(() => {
+    if (!redoRef.current.length) return
+    undoRef.current.push(snapshot())
+    engine.drawings = redoRef.current.pop()!
+    setSelectedId(null)
+    setTick(t => t + 1)
+    redraw()
+  }, [engine, redraw, snapshot])
 
   /* ---------- pointer interaction (capture phase) ---------- */
 
   useEffect(() => {
-    const pos = (e: PointerEvent) => {
+    const pos = (e: { clientX: number; clientY: number }) => {
       const r = container.getBoundingClientRect()
       return { x: e.clientX - r.left, y: e.clientY - r.top }
     }
     const isOwnUi = (e: Event) =>
-      (toolbarRef.current && toolbarRef.current.contains(e.target as Node)) ||
-      (editorRef.current && editorRef.current.parentElement?.contains(e.target as Node))
+      (toolbarRef.current?.contains(e.target as Node) ?? false) ||
+      (menuRef.current?.contains(e.target as Node) ?? false) ||
+      (editorRef.current?.parentElement?.contains(e.target as Node) ?? false)
 
     const consume = (e: Event) => { e.stopPropagation(); e.preventDefault() }
+    const setCursor = (part: HitPart | null) => {
+      container.classList.remove(...ALL_CURSOR_CLASSES)
+      if (part) container.classList.add(CURSOR_CLASS[part])
+    }
     const lockChart = (lock: boolean) => chart.applyOptions({ handleScroll: !lock, handleScale: !lock })
 
+    const finishTool = () => {
+      if (!stayRef.current) setTool('cursor')
+      else pendingRef.current = null
+    }
+
     const onDown = (e: PointerEvent) => {
-      if (isOwnUi(e)) return
+      if (isOwnUi(e) || e.button === 2) return
       const { x, y } = pos(e)
       const t = toolRef.current
       if (editing) setEditing(null)
+      if (menu) setMenu(null)
 
       if (t !== 'cursor') {
         consume(e)
         const anchor = pointToSnappedAnchor(x, y)
         if (!anchor) return
-        if (t === 'hline') {
-          const d: Drawing = { id: nextDrawingId(), kind: 'hline', a: anchor, color: colorRef.current }
+        const base = { color: colorRef.current, width: widthRef.current, style: styleRef.current }
+        if (t === 'hline' || t === 'vline') {
+          commit()
+          const d: Drawing = { id: nextDrawingId(), kind: t, a: anchor, ...base }
           engine.drawings.push(d)
           setSelectedId(d.id)
-          setTool('cursor')
+          finishTool()
         } else if (t === 'text') {
           setEditing({ x, y, anchor, value: '' })
-          setTool('cursor')
+          finishTool()
         } else if (!pendingRef.current) {
           pendingRef.current = { a: anchor, hover: anchor }
           lockChart(true)
         } else {
-          const d: Drawing = { id: nextDrawingId(), kind: t, a: pendingRef.current.a, b: anchor, color: colorRef.current }
+          commit()
+          const d: Drawing = { id: nextDrawingId(), kind: t, a: pendingRef.current.a, b: anchor, ...base }
           engine.drawings.push(d)
           pendingRef.current = null
           lockChart(false)
           setSelectedId(d.id)
-          setTool('cursor')
+          finishTool()
         }
         redraw()
         return
@@ -359,11 +589,10 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
         container.setPointerCapture(e.pointerId)
         lockChart(true)
         setSelectedId(hit.d.id)
-        if (hit.part === 'body') {
-          dragRef.current = { mode: 'move', id: hit.d.id, startX: x, startY: y, origA: { ...hit.d.a }, origB: hit.d.b && { ...hit.d.b } }
-        } else {
-          dragRef.current = { mode: hit.part, id: hit.d.id }
-        }
+        dragSnapRef.current = snapshot()
+        dragRef.current = hit.part === 'body'
+          ? { mode: 'move', id: hit.d.id, startX: x, startY: y, origA: { ...hit.d.a }, origB: hit.d.b && { ...hit.d.b }, moved: false }
+          : { mode: 'handle', id: hit.d.id, part: hit.part, moved: false }
         redraw()
       } else if (selRef.current !== null) {
         setSelectedId(null)
@@ -377,15 +606,39 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
       const pending = pendingRef.current
       if (pending) {
         consume(e)
-        pending.hover = pointToSnappedAnchor(x, y)
+        let a = pointToSnappedAnchor(x, y)
+        if (a && shiftRef.current) {
+          const xa = timeToX(pending.a.time), ya = priceToY(pending.a.price)
+          if (xa !== null && ya !== null) {
+            const c = constrain(xa, ya, x, y)
+            a = pointToSnappedAnchor(c.x, c.y) ?? a
+          }
+        }
+        pending.hover = a
         redraw()
         return
       }
+
       const drag = dragRef.current
-      if (!drag) return
+      if (!drag) {
+        // Hover feedback: halo the drawing under the cursor and show the cursor
+        // that matches whatever handle it's over.
+        const hit = hitTest(x, y)
+        const next = hit ? { id: hit.d.id, part: hit.part } : null
+        const prev = hoverRef.current
+        if (next?.id !== prev?.id || next?.part !== prev?.part) {
+          hoverRef.current = next
+          setCursor(next?.part ?? null)
+          redraw()
+        }
+        return
+      }
+
       consume(e)
       const d = engine.drawings.find(dd => dd.id === drag.id)
       if (!d) { dragRef.current = null; return }
+      drag.moved = true
+
       if (drag.mode === 'move') {
         const bars = getBars()
         const barSpacing = (chart.timeScale().options() as { barSpacing: number }).barSpacing || 8
@@ -399,35 +652,46 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
         }
         d.a = shift(drag.origA)
         if (drag.origB) d.b = shift(drag.origB)
-      } else if (drag.mode === 'left' || drag.mode === 'right') {
-        // Rect side-edge drag: only the time of whichever anchor sits on that
-        // side is updated (price stays put). If the rect was extended on that
-        // side, dragging turns the extension off — matches TradingView UX.
-        if (d.kind !== 'rect' || !d.b) return
+      } else if (drag.part === 'mid') {
+        // The middle handle drags the whole drawing, same as grabbing its body.
         const anchor = pointToSnappedAnchor(x, y)
         if (!anchor) return
-        const xa = timeToX(d.a.time)
-        const xb = timeToX(d.b.time)
-        if (xa === null || xb === null) return
-        // Which anchor is currently on the drag side?
-        const wantMax = drag.mode === 'right'
-        const aIsSide = wantMax ? xa >= xb : xa <= xb
-        if (aIsSide) d.a = { ...d.a, time: anchor.time }
-        else d.b = { ...d.b, time: anchor.time }
-        if (drag.mode === 'left') d.extendLeft = false
-        else d.extendRight = false
+        if (d.kind === 'hline') d.a = { ...d.a, price: anchor.price }
+        else if (d.kind === 'vline') d.a = { ...d.a, time: anchor.time }
+        else if (d.b) {
+          const midTime = (d.a.time + d.b.time) / 2
+          const midPrice = (d.a.price + d.b.price) / 2
+          const dt = anchor.time - midTime, dp = anchor.price - midPrice
+          const bars = getBars()
+          const move = (p: Anchor): Anchor => {
+            const idx = Math.max(0, Math.min(bars.length - 1, nearestIndex(bars, p.time + dt)))
+            return { time: bars.length ? bars[idx].time : p.time, price: p.price + dp }
+          }
+          d.a = move(d.a); d.b = move(d.b)
+        } else {
+          d.a = anchor
+        }
       } else {
         const anchor = pointToSnappedAnchor(x, y)
-        if (anchor) {
-          if (drag.mode === 'a') d.a = anchor
-          else if (d.b) d.b = anchor
-        }
+        if (!anchor) return
+        if (d.kind === 'hline') d.a = { ...d.a, price: anchor.price }
+        else if (d.kind === 'vline') d.a = { ...d.a, time: anchor.time }
+        else resizeByPart(d, drag.part, anchor)
       }
       redraw()
     }
 
     const onUp = (e: PointerEvent) => {
-      if (dragRef.current) {
+      const drag = dragRef.current
+      if (drag) {
+        // Only record an undo step if something actually moved.
+        if (drag.moved && dragSnapRef.current) {
+          undoRef.current.push(dragSnapRef.current)
+          if (undoRef.current.length > MAX_UNDO) undoRef.current.shift()
+          redoRef.current.length = 0
+          setTick(t => t + 1)
+        }
+        dragSnapRef.current = null
         dragRef.current = null
         chart.applyOptions({ handleScroll: true, handleScale: true })
         try { container.releasePointerCapture(e.pointerId) } catch { /* not captured */ }
@@ -437,8 +701,7 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
 
     const onDblClick = (e: MouseEvent) => {
       if (isOwnUi(e)) return
-      const r = container.getBoundingClientRect()
-      const x = e.clientX - r.left, y = e.clientY - r.top
+      const { x, y } = pos(e)
       const hit = hitTest(x, y)
       if (!hit) return
       consume(e)
@@ -446,41 +709,103 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
       setEditing({ x, y, id: hit.d.id, value: hit.d.text ?? '' })
     }
 
+    const onContext = (e: MouseEvent) => {
+      if (isOwnUi(e)) return
+      const { x, y } = pos(e)
+      const hit = hitTest(x, y)
+      if (!hit) return
+      consume(e)
+      setSelectedId(hit.d.id)
+      setMenu({ x, y, id: hit.d.id })
+    }
+
+    const onLeave = () => {
+      if (hoverRef.current) { hoverRef.current = null; setCursor(null); redraw() }
+    }
+
     container.addEventListener('pointerdown', onDown, true)
     container.addEventListener('pointermove', onMove, true)
     container.addEventListener('pointerup', onUp, true)
     container.addEventListener('dblclick', onDblClick, true)
+    container.addEventListener('contextmenu', onContext, true)
+    container.addEventListener('pointerleave', onLeave)
     return () => {
       container.removeEventListener('pointerdown', onDown, true)
       container.removeEventListener('pointermove', onMove, true)
       container.removeEventListener('pointerup', onUp, true)
       container.removeEventListener('dblclick', onDblClick, true)
+      container.removeEventListener('contextmenu', onContext, true)
+      container.removeEventListener('pointerleave', onLeave)
+      container.classList.remove(...ALL_CURSOR_CLASSES)
     }
-  }, [chart, container, engine, series, getBars, pointToSnappedAnchor, hitTest, redraw, editing])
+  }, [chart, container, engine, series, getBars, pointToSnappedAnchor, hitTest, redraw, editing, menu,
+      commit, snapshot, timeToX, priceToY])
 
-  /* ---------- keyboard: delete / escape ---------- */
+  /* ---------- keyboard ---------- */
 
   useEffect(() => {
+    const TOOL_KEYS: Record<string, Tool> = {
+      KeyT: 'trend', KeyH: 'hline', KeyV: 'vline', KeyR: 'rect',
+      KeyF: 'fib', KeyY: 'ray', KeyE: 'extended', KeyX: 'text',
+    }
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return
+      shiftRef.current = e.shiftKey
+      const mod = e.ctrlKey || e.metaKey
+
+      if (mod && e.code === 'KeyZ') {
+        e.preventDefault()
+        e.shiftKey ? redo() : undo()
+        return
+      }
+      if (mod && e.code === 'KeyY') { e.preventDefault(); redo(); return }
+      if (mod && e.code === 'KeyD' && selRef.current !== null) {
+        e.preventDefault(); duplicateDrawing(selRef.current); return
+      }
+      if (mod && e.code === 'KeyC' && selRef.current !== null) {
+        const d = engine.drawings.find(x => x.id === selRef.current)
+        if (d) clipboardRef.current = cloneDrawings([d])[0]
+        return
+      }
+      if (mod && e.code === 'KeyV' && clipboardRef.current) {
+        e.preventDefault()
+        commit()
+        const copy = { ...cloneDrawings([clipboardRef.current])[0], id: nextDrawingId() }
+        engine.drawings.push(copy)
+        setSelectedId(copy.id)
+        redraw()
+        return
+      }
+      // Alt + letter picks a tool, the way charting packages tend to.
+      if (e.altKey && TOOL_KEYS[e.code]) {
+        e.preventDefault()
+        pendingRef.current = null
+        setTool(TOOL_KEYS[e.code])
+        return
+      }
       if ((e.code === 'Delete' || e.code === 'Backspace') && selRef.current !== null) {
         e.preventDefault()
-        engine.drawings = engine.drawings.filter(d => d.id !== selRef.current)
-        setSelectedId(null)
-        redraw()
+        removeDrawing(selRef.current)
       } else if (e.code === 'Escape') {
         pendingRef.current = null
         chart.applyOptions({ handleScroll: true, handleScale: true })
         setTool('cursor')
         setSelectedId(null)
         setEditing(null)
+        setMenu(null)
+        setShowSettings(false)
         redraw()
       }
     }
+    const onKeyUp = (e: KeyboardEvent) => { shiftRef.current = e.shiftKey }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [engine, chart, redraw])
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keyup', onKeyUp)
+    }
+  }, [engine, chart, redraw, undo, redo, duplicateDrawing, removeDrawing, commit])
 
   /* ---------- redraw triggers ---------- */
 
@@ -499,42 +824,23 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     }
   }, [chart, container, engine, redraw])
 
-  // lightweight-charts' price scale has no change-subscription API at all, so dragging
-  // the right-hand axis to rescale vertically (or any other future scale-changing
-  // gesture) never fires a redraw on its own — keep repainting every frame while any
-  // pointer button is held down anywhere, so drawings never visibly detach mid-drag.
-  useEffect(() => {
-    let raf: number | null = null
-    const loop = () => { redraw(); raf = requestAnimationFrame(loop) }
-    const onPointerDown = () => { if (raf === null) raf = requestAnimationFrame(loop) }
-    const onPointerUp = () => { if (raf !== null) { cancelAnimationFrame(raf); raf = null } }
-    window.addEventListener('pointerdown', onPointerDown, true)
-    window.addEventListener('pointerup', onPointerUp, true)
-    return () => {
-      window.removeEventListener('pointerdown', onPointerDown, true)
-      window.removeEventListener('pointerup', onPointerUp, true)
-      if (raf !== null) cancelAnimationFrame(raf)
-    }
-  }, [redraw])
-
-  useEffect(() => { redraw() }, [dataVersion, selectedId, tool, redraw])
+  useEffect(() => { redraw() }, [dataVersion, selectedId, redraw])
   useEffect(() => { onCanvas(canvasRef.current); return () => onCanvas(null) }, [onCanvas])
-  useEffect(() => {
-    container.style.cursor = tool === 'cursor' ? '' : 'crosshair'
-    return () => { container.style.cursor = '' }
-  }, [tool, container])
-  useEffect(() => { editorRef.current?.focus() }, [editing])
 
-  /* ---------- text editor commit ---------- */
+  /* ---------- text editing ---------- */
 
-  const commitEditing = () => {
+  const commitText = () => {
     if (!editing) return
-    const value = editing.value.trim()
+    const v = editing.value.trim()
+    commit()
     if (editing.id !== undefined) {
-      const d = engine.drawings.find(dd => dd.id === editing.id)
-      if (d) d.text = value || undefined
-    } else if (editing.anchor && value) {
-      const d: Drawing = { id: nextDrawingId(), kind: 'text', a: editing.anchor, color: colorRef.current, text: value }
+      const d = engine.drawings.find(x => x.id === editing.id)
+      if (d) d.text = v || undefined
+    } else if (editing.anchor && v) {
+      const d: Drawing = {
+        id: nextDrawingId(), kind: 'text', a: editing.anchor, text: v,
+        color: colorRef.current, width: widthRef.current, style: styleRef.current,
+      }
       engine.drawings.push(d)
       setSelectedId(d.id)
     }
@@ -542,223 +848,315 @@ export default function DrawingLayer({ container, chart, series, engine, getBars
     redraw()
   }
 
-  const recolorSelected = (c: string) => {
-    setColor(c)
-    if (selRef.current !== null) {
-      const d = engine.drawings.find(dd => dd.id === selRef.current)
-      if (d) { d.color = c; redraw() }
-    }
-  }
-
-  // Selected rectangle (if any) — powers the visibility + state of the extend
-  // buttons at the bottom of the toolbar.
-  const selectedRect = selectedId !== null
-    ? engine.drawings.find(d => d.id === selectedId && d.kind === 'rect')
-    : undefined
-
-  const toggleExtend = (side: 'left' | 'right' | 'both') => {
-    if (!selectedRect) return
-    if (side === 'both') {
-      const on = !(selectedRect.extendLeft && selectedRect.extendRight)
-      selectedRect.extendLeft = on
-      selectedRect.extendRight = on
-    } else if (side === 'left') {
-      selectedRect.extendLeft = !selectedRect.extendLeft
-    } else {
-      selectedRect.extendRight = !selectedRect.extendRight
-    }
+  const clearAll = () => {
+    if (!engine.drawings.length) return
+    commit()
+    engine.drawings = []
+    setSelectedId(null)
     redraw()
   }
 
   const TOOLS: { key: Tool; icon: string; title: string }[] = [
     { key: 'cursor', icon: '⊹', title: 'Select / move (Esc)' },
-    { key: 'trend', icon: '╱', title: 'Trendline — click start, click end' },
-    { key: 'rect', icon: '▭', title: 'Rectangle — click two corners, double-click to write in it' },
-    { key: 'hline', icon: '─', title: 'Horizontal line' },
-    { key: 'text', icon: 'T', title: 'Text note' },
+    { key: 'trend', icon: '╱', title: 'Trendline — click start, click end (Alt+T) · hold Shift to constrain' },
+    { key: 'ray', icon: '➚', title: 'Ray — extends past the second point (Alt+Y)' },
+    { key: 'extended', icon: '✕', title: 'Extended line — runs both ways (Alt+E)' },
+    { key: 'hline', icon: '─', title: 'Horizontal line (Alt+H)' },
+    { key: 'vline', icon: '│', title: 'Vertical line (Alt+V)' },
+    { key: 'rect', icon: '▭', title: 'Rectangle — two corners, double-click to write in it (Alt+R)' },
+    { key: 'fib', icon: 'ƒ', title: 'Fib retracement — drag the leg, levels extend right (Alt+F)' },
+    { key: 'text', icon: 'T', title: 'Text note (Alt+X)' },
   ]
 
   const magnetNext: Record<MagnetMode, MagnetMode> = { off: 'weak', weak: 'strong', strong: 'off' }
   const magnetLabel: Record<MagnetMode, string> = {
     off: 'Magnet: off — click to enable weak snap',
-    weak: 'Magnet: weak — snaps to OHLC when cursor is near a price line (click to switch to strong)',
-    strong: 'Magnet: strong — always snaps to nearest OHLC of the bar under cursor (click to turn off)',
+    weak: 'Magnet: weak — snaps to OHLC when the cursor is near a price line (click for strong)',
+    strong: 'Magnet: strong — always snaps to the nearest OHLC of the bar under the cursor (click to turn off)',
   }
+
+  const railBtn = (on: boolean) =>
+    `w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
+      on ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
+    }`
 
   return (
     <>
       <canvas ref={canvasRef} className="absolute inset-0 z-[3] pointer-events-none" style={{ width: '100%', height: '100%' }} />
+
       <div ref={toolbarRef} className="absolute left-1.5 top-1.5 z-[5] flex flex-col gap-1 bg-surface/90 border border-white/10 rounded-lg p-1">
         {TOOLS.map(t => (
           <button
             key={t.key}
             title={t.title}
-            className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
-              tool === t.key ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
-            }`}
+            className={railBtn(tool === t.key)}
             onClick={() => { pendingRef.current = null; setTool(t.key) }}
           >
             {t.icon}
           </button>
         ))}
-        <div className="h-px bg-hairline my-0.5" />
-        {DRAW_COLORS.map(c => (
-          <button
-            key={c}
-            title="Color (applies to selected drawing too)"
-            className={`w-7 h-5 rounded-md flex items-center justify-center ${color === c ? 'bg-white/15' : 'hover:bg-white/10'}`}
-            onClick={() => recolorSelected(c)}
-          >
-            <span className="w-3.5 h-3.5 rounded-full border border-black/40" style={{ background: c }} />
-          </button>
-        ))}
-        <div className="h-px bg-hairline my-0.5" />
+
+        <div className="h-px bg-white/10 my-0.5" />
+
+        <div className="grid grid-cols-3 gap-0.5 px-0.5">
+          {DRAW_COLORS.map(c => (
+            <button
+              key={c}
+              title="Colour — applies to the selected drawing too"
+              className={`w-3.5 h-3.5 rounded-full border ${color === c ? 'border-white' : 'border-white/20'}`}
+              style={{ background: c }}
+              onClick={() => { setColor(c); if (selRef.current !== null) patchSelected({ color: c }) }}
+            />
+          ))}
+        </div>
+
+        <button
+          title="Line width / style, and settings for the selected drawing"
+          className={railBtn(showSettings)}
+          onClick={() => setShowSettings(v => !v)}
+        >≡</button>
+
         <button
           title={magnetLabel[magnet]}
-          className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
-            magnet === 'off' ? 'text-ink2 hover:bg-white/10' : magnet === 'weak' ? 'bg-warn/25 text-warn' : 'bg-accent text-white'
-          }`}
-          onClick={() => setMagnet(m => magnetNext[m])}
+          className={railBtn(magnet !== 'off')}
+          onClick={() => setMagnet(magnetNext[magnet])}
         >
-          🧲
+          {magnet === 'strong' ? '🧲' : magnet === 'weak' ? '🧲' : '⌁'}
         </button>
-        <div className="h-px bg-hairline my-0.5" />
+
+        <button
+          title={stayInTool ? 'Staying in the tool after each drawing — click to go back to the cursor each time' : 'Returning to the cursor after each drawing — click to stay in the tool'}
+          className={railBtn(stayInTool)}
+          onClick={() => setStayInTool(v => !v)}
+        >⇄</button>
+
+        <div className="h-px bg-white/10 my-0.5" />
+
+        <button
+          title="Undo (Ctrl+Z)"
+          className={`${railBtn(false)} disabled:opacity-30`}
+          disabled={!undoRef.current.length}
+          onClick={undo}
+        >↶</button>
+        <button
+          title="Redo (Ctrl+Shift+Z)"
+          className={`${railBtn(false)} disabled:opacity-30`}
+          disabled={!redoRef.current.length}
+          onClick={redo}
+        >↷</button>
         <button
           title="Delete selected (Del)"
-          className="w-7 h-7 rounded-md text-sm text-ink2 hover:bg-white/10 disabled:opacity-30"
-          disabled={selectedId === null}
-          onClick={() => {
-            engine.drawings = engine.drawings.filter(d => d.id !== selectedId)
-            setSelectedId(null)
-            redraw()
-          }}
-        >
-          🗑
-        </button>
+          className="w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center text-ink2 hover:bg-white/10 hover:text-down"
+          onClick={() => selectedId !== null && removeDrawing(selectedId)}
+        >⌫</button>
         <button
           title="Clear all drawings"
-          className="w-7 h-7 rounded-md text-xs text-ink2 hover:bg-white/10 disabled:opacity-30"
-          disabled={!engine.drawings.length}
-          onClick={() => {
-            if (confirm('Remove all drawings?')) { engine.drawings = []; setSelectedId(null); redraw() }
-          }}
-        >
-          ✕
-        </button>
-        {selectedRect && (
-          <>
-            <div className="h-px bg-hairline my-0.5" />
-            <button
-              title="Extend rectangle left to the pane edge"
-              className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
-                selectedRect.extendLeft ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
-              }`}
-              onClick={() => toggleExtend('left')}
-            >
-              ⇤
-            </button>
-            <button
-              title="Extend rectangle right to the pane edge (great for open zones)"
-              className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
-                selectedRect.extendRight ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
-              }`}
-              onClick={() => toggleExtend('right')}
-            >
-              ⇥
-            </button>
-            <button
-              title="Extend both sides to the pane edges"
-              className={`w-7 h-7 rounded-md text-sm leading-none flex items-center justify-center transition-colors ${
-                selectedRect.extendLeft && selectedRect.extendRight ? 'bg-accent text-white' : 'text-ink2 hover:bg-white/10'
-              }`}
-              onClick={() => toggleExtend('both')}
-            >
-              ⇹
-            </button>
-          </>
-        )}
+          className="w-7 h-7 rounded-md text-xs leading-none flex items-center justify-center text-ink2 hover:bg-white/10 hover:text-down"
+          onClick={clearAll}
+        >✕✕</button>
       </div>
-      {editing && (() => {
-        const target = editing.id !== undefined ? engine.drawings.find(dd => dd.id === editing.id) : undefined
-        const showAlign = target && target.kind !== 'text'
-        const setAlign = (patch: { textH?: TextH; textV?: TextV }) => {
-          if (!target) return
-          Object.assign(target, patch)
-          redraw()
-          editorRef.current?.focus()
-        }
+
+      {showSettings && (
+        <div className="absolute left-11 top-1.5 z-[6] w-52 bg-surface border border-white/10 rounded-lg p-2.5 space-y-2.5 shadow-xl">
+          <div className="text-[11px] font-semibold text-ink">
+            {selected ? KIND_LABEL[selected.kind] : 'New drawing defaults'}
+          </div>
+          <div>
+            <div className="text-[10px] text-muted mb-1">Width</div>
+            <div className="flex gap-1">
+              {LINE_WIDTHS.map(w => (
+                <button
+                  key={w}
+                  className={`flex-1 h-6 rounded border flex items-center justify-center ${
+                    (selected?.width ?? width) === w ? 'border-accent bg-accent/15' : 'border-hairline hover:border-white/30'
+                  }`}
+                  onClick={() => { setWidth(w); patchSelected({ width: w }) }}
+                >
+                  <span className="block w-5 rounded-full bg-ink2" style={{ height: w }} />
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-muted mb-1">Style</div>
+            <div className="flex gap-1">
+              {LINE_STYLES.map(s => (
+                <button
+                  key={s}
+                  className={`flex-1 text-[10px] py-1 rounded border capitalize ${
+                    (selected?.style ?? style) === s ? 'border-accent bg-accent/15 text-ink' : 'border-hairline text-muted hover:border-white/30'
+                  }`}
+                  onClick={() => { setStyle(s); patchSelected({ style: s }) }}
+                >{s}</button>
+              ))}
+            </div>
+          </div>
+          {selected && (selected.kind === 'rect' || selected.kind === 'fib') && (
+            <div>
+              <div className="text-[10px] text-muted mb-1">Fill {Math.round((selected.fillOpacity ?? 0.13) * 100)}%</div>
+              <input
+                type="range" min={0} max={60} step={1}
+                value={Math.round((selected.fillOpacity ?? 0.13) * 100)}
+                onChange={e => patchSelected({ fillOpacity: +e.target.value / 100 })}
+                className="w-full accent-[#3987e5]"
+              />
+            </div>
+          )}
+          {selected && selected.kind === 'rect' && (
+            <div className="flex gap-1">
+              <button
+                className={`flex-1 text-[10px] py-1 rounded border ${selected.extendLeft ? 'border-accent bg-accent/15 text-ink' : 'border-hairline text-muted'}`}
+                onClick={() => patchSelected({ extendLeft: !selected.extendLeft })}
+              >Extend ◀</button>
+              <button
+                className={`flex-1 text-[10px] py-1 rounded border ${selected.extendRight ? 'border-accent bg-accent/15 text-ink' : 'border-hairline text-muted'}`}
+                onClick={() => patchSelected({ extendRight: !selected.extendRight })}
+              >Extend ▶</button>
+            </div>
+          )}
+          {selected && <TextAlignControls d={selected} onChange={patchSelected} />}
+          <div className="text-[10px] text-muted leading-relaxed border-t border-hairline pt-2">
+            Shift constrains a new line to 0° / 45° / 90°. Right-click a drawing for more.
+          </div>
+        </div>
+      )}
+
+      {menu && (() => {
+        const d = engine.drawings.find(x => x.id === menu.id)
+        if (!d) return null
+        const item = 'w-full text-left px-2.5 py-1 text-[11px] text-ink2 hover:bg-white/10 rounded'
         return (
           <div
-            className="absolute z-[6] bg-surface border border-white/15 rounded-lg p-1.5 shadow-xl"
-            style={{ left: Math.min(editing.x, container.clientWidth - 210), top: Math.min(editing.y, container.clientHeight - 110) }}
+            ref={menuRef}
+            className="absolute z-[7] w-40 bg-surface border border-white/10 rounded-lg p-1 shadow-xl"
+            style={{ left: Math.min(menu.x, container.clientWidth - 170), top: Math.min(menu.y, container.clientHeight - 190) }}
           >
-            <textarea
-              ref={editorRef}
-              rows={2}
-              className="input !w-44 text-xs"
-              placeholder="Type… (Enter to save)"
-              value={editing.value}
-              onChange={e => setEditing(ed => ed && { ...ed, value: e.target.value })}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitEditing() }
-                else if (e.key === 'Escape') setEditing(null)
-              }}
-              onBlur={e => {
-                // keep the editor open when clicking its own alignment buttons
-                if (!(e.relatedTarget && e.currentTarget.parentElement?.contains(e.relatedTarget as Node))) commitEditing()
-              }}
-            />
-            {showAlign && (
-              <div className="flex items-center gap-1 mt-1 text-[10px] text-muted">
-                <span>Text:</span>
-                {(['left', 'center', 'right'] as TextH[]).map(hv => (
-                  <button
-                    key={hv}
-                    className={`px-1.5 py-0.5 rounded ${(target.textH ?? 'left') === hv ? 'bg-accent text-white' : 'bg-white/5 hover:bg-white/10'}`}
-                    onMouseDown={e => e.preventDefault()}
-                    onClick={() => setAlign({ textH: hv })}
-                  >
-                    {hv === 'left' ? '⇤' : hv === 'center' ? '↔' : '⇥'}
-                  </button>
-                ))}
-                <span className="w-1" />
-                {(['top', 'middle', 'bottom'] as TextV[]).map(vv => (
-                  <button
-                    key={vv}
-                    className={`px-1.5 py-0.5 rounded ${(target.textV ?? 'top') === vv ? 'bg-accent text-white' : 'bg-white/5 hover:bg-white/10'}`}
-                    onMouseDown={e => e.preventDefault()}
-                    onClick={() => setAlign({ textV: vv })}
-                  >
-                    {vv === 'top' ? '⇡' : vv === 'middle' ? '↕' : '⇣'}
-                  </button>
-                ))}
-              </div>
-            )}
+            <div className="px-2.5 py-1 text-[10px] text-muted">{KIND_LABEL[d.kind]}</div>
+            <button className={item} onClick={() => { setShowSettings(true); setMenu(null) }}>Settings…</button>
+            <button className={item} onClick={() => duplicateDrawing(d.id)}>Duplicate <span className="text-muted">Ctrl+D</span></button>
+            <button className={item} onClick={() => reorder(d.id, true)}>Bring to front</button>
+            <button className={item} onClick={() => reorder(d.id, false)}>Send to back</button>
+            <button className={item} onClick={() => { commit(); d.locked = !d.locked; setMenu(null); setSelectedId(null); redraw() }}>
+              {d.locked ? 'Unlock' : 'Lock'}
+            </button>
+            <div className="h-px bg-white/10 my-1" />
+            <button className={`${item} hover:text-down`} onClick={() => removeDrawing(d.id)}>Delete <span className="text-muted">Del</span></button>
           </div>
         )
       })()}
+
+      {editing && (
+        <div className="absolute z-[6]" style={{ left: Math.min(editing.x, container.clientWidth - 190), top: Math.min(editing.y, container.clientHeight - 90) }}>
+          <textarea
+            ref={editorRef}
+            autoFocus
+            className="input !w-44 !py-1 text-xs min-h-[54px]"
+            placeholder="Note… (Enter to save)"
+            value={editing.value}
+            onChange={e => setEditing({ ...editing, value: e.target.value })}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitText() }
+              else if (e.key === 'Escape') { e.preventDefault(); setEditing(null) }
+            }}
+            onBlur={commitText}
+          />
+        </div>
+      )}
     </>
   )
 }
 
-/* ---------- canvas helpers ---------- */
+/* ---------------- small pieces ---------------- */
 
-function handle(ctx: CanvasRenderingContext2D, x: number, y: number, color: string, filled = false) {
+function TextAlignControls({ d, onChange }: { d: Drawing; onChange: (p: Partial<Drawing>) => void }) {
+  if (d.kind === 'text' || !d.text) return null
+  const hs: TextH[] = ['left', 'center', 'right']
+  const vs: TextV[] = ['top', 'middle', 'bottom']
+  const cell = (on: boolean) =>
+    `flex-1 text-[10px] py-1 rounded border capitalize ${on ? 'border-accent bg-accent/15 text-ink' : 'border-hairline text-muted hover:border-white/30'}`
+  return (
+    <div className="space-y-1">
+      <div className="text-[10px] text-muted">Label</div>
+      <div className="flex gap-1">
+        {hs.map(h => (
+          <button key={h} className={cell((d.textH ?? 'left') === h)} onClick={() => onChange({ textH: h })}>{h}</button>
+        ))}
+      </div>
+      <div className="flex gap-1">
+        {vs.map(v => (
+          <button key={v} className={cell((d.textV ?? 'top') === v)} onClick={() => onChange({ textV: v })}>{v}</button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** Selection handle: white core with the drawing's colour as the ring. */
+function handleDot(ctx: CanvasRenderingContext2D, x: number, y: number, color: string, active: boolean) {
+  const r = active ? 5 : 4
   ctx.save()
-  ctx.fillStyle = filled ? color : '#1a1a19'
-  ctx.strokeStyle = color
-  ctx.lineWidth = 1.5
+  ctx.setLineDash([])
   ctx.beginPath()
-  ctx.arc(x, y, 4.5, 0, Math.PI * 2)
+  ctx.arc(x, y, r, 0, Math.PI * 2)
+  ctx.fillStyle = active ? color : '#ffffff'
   ctx.fill()
+  ctx.lineWidth = 1.5
+  ctx.strokeStyle = active ? '#ffffff' : color
   ctx.stroke()
+  ctx.restore()
+}
+
+function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+  ctx.beginPath()
+  ctx.moveTo(x + r, y)
+  ctx.arcTo(x + w, y, x + w, y + h, r)
+  ctx.arcTo(x + w, y + h, x, y + h, r)
+  ctx.arcTo(x, y + h, x, y, r)
+  ctx.arcTo(x, y, x + w, y, r)
+  ctx.closePath()
+}
+
+function placeLabel(ctx: CanvasRenderingContext2D, d: Drawing, g: Geom, paneW: number) {
+  const lines = (d.text ?? '').split('\n').length
+  ctx.save()
+  ctx.setLineDash([])
+  if (d.kind === 'hline') {
+    const tx = d.textH === 'center' ? paneW / 2 : d.textH === 'right' ? paneW - 6 : 6
+    const ty = d.textV === 'middle' ? g.ya - 6 : d.textV === 'bottom' ? g.ya + 4 : g.ya - 15
+    ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
+    drawText(ctx, d.text!, tx, ty)
+  } else if (d.kind === 'rect' || d.kind === 'fib') {
+    const rw = g.xRight - g.xLeft, rh = g.yBottom - g.yTop
+    const tx = d.textH === 'center' ? g.xLeft + rw / 2 : d.textH === 'right' ? g.xLeft + rw - 5 : g.xLeft + 5
+    const ty = d.textV === 'middle' ? g.yTop + rh / 2 - (lines * 14) / 2 + 2 : d.textV === 'bottom' ? g.yTop + rh - lines * 14 - 3 : g.yTop + 4
+    ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
+    drawText(ctx, d.text!, tx, ty, rw - 10)
+  } else if (g.xb !== null && g.yb !== null) {
+    const [sx, sy] = g.xa <= g.xb ? [g.xa, g.ya] : [g.xb, g.yb]
+    const [ex, ey] = g.xa <= g.xb ? [g.xb, g.yb] : [g.xa, g.ya]
+    const tx = d.textH === 'center' ? (sx + ex) / 2 : d.textH === 'right' ? ex : sx
+    const anchorY = d.textH === 'center' ? (sy + ey) / 2 : d.textH === 'right' ? ey : sy
+    const ty = d.textV === 'middle' ? anchorY - 6 : d.textV === 'bottom' ? anchorY + 8 : anchorY - 6 - lines * 14
+    ctx.textAlign = d.textH === 'center' ? 'center' : d.textH === 'right' ? 'right' : 'left'
+    drawText(ctx, d.text!, tx, ty)
+  } else {
+    ctx.restore()
+    return
+  }
   ctx.restore()
 }
 
 function drawText(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth?: number) {
   const lines = text.split('\n')
   lines.forEach((line, i) => {
-    if (maxWidth !== undefined && maxWidth > 20) ctx.fillText(line, x, y + i * 14, maxWidth)
-    else ctx.fillText(line, x, y + i * 14)
+    const t = maxWidth !== undefined ? clip(ctx, line, maxWidth) : line
+    ctx.fillText(t, x, y + i * 14)
   })
+}
+
+function clip(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (maxWidth <= 0 || ctx.measureText(text).width <= maxWidth) return text
+  let s = text
+  while (s.length > 1 && ctx.measureText(s + '…').width > maxWidth) s = s.slice(0, -1)
+  return s + '…'
 }
