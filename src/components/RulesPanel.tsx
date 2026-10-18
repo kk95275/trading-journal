@@ -104,11 +104,13 @@ function RuleSummary({ rules, value }: { rules: RuleSet; value: SessionRules }) 
     stage.profitTargetPct > 0
       ? ['Profit target', `${stage.profitTargetPct}% · ${fmtUsd(size * stage.profitTargetPct / 100, 0)}`]
       : ['Profit target', 'none'],
-    ['Daily loss', `${rules.dailyLossPct}% · ${fmtUsd(dailyUsd, 0)}${basis === 'startOfDayEquity' ? ' of day-start equity' : ' fixed'}`],
+    ['Daily loss', `${rules.dailyLossPct}% · ${fmtUsd(dailyUsd, 0)}${basis === 'startOfDayEquity' ? ' of day-start' : ' fixed'}, off ${rules.dailyBaseline}`],
     ['Max drawdown', `${ddPct}% ${rules.maxDrawdownTrailing ? 'trailing' : 'static'} · floor ${fmtUsd(size * (1 - ddPct / 100), 0)}`],
     ['Min trading days', stage.minTradingDays ? String(stage.minTradingDays) : '—'],
-    ['Margin cap', rules.marginExposureMaxPct ? `${rules.marginExposureMaxPct}% of equity` : '—'],
-    ['Commission', `${fmtUsd(rules.commissionPerLot, 0)}/lot round-turn`],
+    ['Margin cap', rules.marginExposureMaxPct ? `${rules.marginExposureMaxPct}% of equity` : 'none'],
+    ['Commission', rules.commissionPerLot !== undefined
+      ? `${fmtUsd(rules.commissionPerLot, 0)}/lot round-turn`
+      : 'varies by instrument — yours'],
   ]
   return (
     <div className="space-y-1 text-[11px]">
@@ -123,9 +125,9 @@ function RuleSummary({ rules, value }: { rules: RuleSet; value: SessionRules }) 
         <span className="text-ink2 text-right">
           {[
             !rules.allowHedging && 'no hedging',
-            rules.weekendFlat && 'flat before Friday close',
+            (stage.weekendFlat ?? rules.weekendFlat) && 'flat before Friday close',
             rules.softRiskPerIdeaPct && `${rules.softRiskPerIdeaPct}%/idea warning`,
-          ].filter(Boolean).join(' · ')}
+          ].filter(Boolean).join(' · ') || 'nothing beyond the limits above'}
         </span>
       </div>
     </div>
@@ -149,17 +151,18 @@ function RuleOverrideControls({
   const set = (o: Partial<SessionRules['overrides']>) =>
     onChange({ ...value, overrides: { ...value.overrides, ...o } })
 
-  // Only offer the 8/10 choice where the sources actually conflict (Step 1).
-  const ddChoices = stage.id === 'step1' ? [8, 10] : [stage.maxDrawdownPct]
+  // Only offered where the firm's own sources actually conflict.
+  const ddChoices = stage.maxDrawdownChoices ?? []
   const dd = value.overrides.maxDrawdownPct ?? stage.maxDrawdownPct
   const basis = value.overrides.dailyLossBasis ?? rules.dailyLossBasis
+  if (ddChoices.length < 2 && !rules.dailyBasisAmbiguous) return null
 
   return (
     <div className="space-y-2 border-t border-hairline pt-2">
       {ddChoices.length > 1 && (
         <div>
           <div className="text-[11px] text-muted mb-1">
-            Step 1 max drawdown — the rules page says 10%, the Help Centre says 8%
+            {stage.name} max drawdown — {rules.firm}'s pages disagree
           </div>
           <div className="flex gap-1.5">
             {ddChoices.map(p => (
@@ -174,6 +177,7 @@ function RuleOverrideControls({
           </div>
         </div>
       )}
+      {rules.dailyBasisAmbiguous && (
       <div>
         <div className="text-[11px] text-muted mb-1">Daily loss is {rules.dailyLossPct}% of…</div>
         <div className="flex gap-1.5">
@@ -191,6 +195,7 @@ function RuleOverrideControls({
           </button>
         </div>
       </div>
+      )}
     </div>
   )
 }

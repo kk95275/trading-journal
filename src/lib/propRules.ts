@@ -24,6 +24,18 @@ export interface RuleStage {
   /** % of initial balance. Overridable per session — see RuleOverrides. */
   maxDrawdownPct: number
   minTradingDays: number
+  /**
+   * Overrides the rule set's weekendFlat for this stage. FTMO, for instance,
+   * only restricts holding through market breaks once you're funded — the
+   * Challenge and Verification phases are free to hold over a weekend.
+   */
+  weekendFlat?: boolean
+  /**
+   * Set only where the firm's own pages disagree about this stage's drawdown.
+   * The setup screen then offers the choice instead of picking silently;
+   * maxDrawdownPct stays the default, and should be the stricter reading.
+   */
+  maxDrawdownChoices?: number[]
   /** Stage-only conditions worth showing in the setup panel. */
   notes?: string[]
 }
@@ -36,13 +48,27 @@ export interface RuleSet {
   stages: RuleStage[]
   dailyLossPct: number
   dailyLossBasis: DailyLossBasis
-  /** Broker server timezone for the 00:00 daily reset. 'eet' = UTC+2/+3 with EU DST. */
-  serverTz: 'eet' | 'utc'
+  /**
+   * What the day's floor is measured down FROM, captured at the daily reset.
+   * IC measures from end-of-day equity; FTMO is explicit that it uses the
+   * account BALANCE at 00:00, which ignores a position's floating loss and so
+   * leaves the floor higher than an equity baseline would.
+   */
+  dailyBaseline: 'balance' | 'equity'
+  /**
+   * True where the firm states a percentage without saying what it applies to,
+   * so the setup screen offers both readings rather than guessing.
+   */
+  dailyBasisAmbiguous?: boolean
+  /** Server timezone for the 00:00 daily reset, both with EU DST. */
+  serverTz: 'eet' | 'cet' | 'utc'
   maxDrawdownTrailing: boolean
   /** Margin in use must stay under this % of equity, or the account hard-breaches. */
   marginExposureMaxPct?: number
-  leverage: Record<AssetClass, number>
-  commissionPerLot: number
+  /** Required only when marginExposureMaxPct is set — that's the only thing it feeds. */
+  leverage?: Record<AssetClass, number>
+  /** Omit where the firm's commission varies by instrument; the field stays editable. */
+  commissionPerLot?: number
   allowHedging: boolean
   /** Positions must be flat before Friday close. */
   weekendFlat: boolean
@@ -91,6 +117,7 @@ export const IC_FUNDED_25K: RuleSet = {
       // The rules page says 10%, the Help Centre says 8% for Step 1. Default to the
       // stricter reading: pass under 8% and you have passed under 10% either way.
       maxDrawdownPct: 8,
+      maxDrawdownChoices: [8, 10],
       minTradingDays: 3,
       notes: ['News trading allowed', 'Step 1 profit does not carry into Step 2'],
     },
@@ -118,6 +145,9 @@ export const IC_FUNDED_25K: RuleSet = {
   // "$1,250 on $25K" reads as a fixed 5% of the initial balance, measured down from
   // the previous end-of-day equity. Switchable per session — see RuleOverrides.
   dailyLossBasis: 'initialBalance',
+  // "measured against end-of-day equity" — the floor hangs off equity, not balance.
+  dailyBaseline: 'equity',
+  dailyBasisAmbiguous: true,
   serverTz: 'eet',
   maxDrawdownTrailing: false,
   marginExposureMaxPct: 75,
@@ -137,7 +167,82 @@ export const IC_FUNDED_25K: RuleSet = {
   ],
 }
 
-export const RULE_SETS: RuleSet[] = [IC_FUNDED_25K]
+/**
+ * FTMO FTMO Challenge: 2-Step, $25,000. Read from ftmo.com's Trading Objectives
+ * and FAQ pages, October 2026.
+ *
+ * Differs from IC in ways that matter to a backtest: the daily floor is measured
+ * from the BALANCE at 00:00 CE(S)T rather than equity, hedging is allowed, there
+ * is no margin-exposure rule, and the news and market-break restrictions apply
+ * only once you are funded — the Challenge and Verification phases may hold over
+ * a weekend and trade straight through news.
+ */
+export const FTMO_2STEP_25K: RuleSet = {
+  id: 'ftmo-2step-25k',
+  name: 'FTMO — 2-Step Challenge 25K',
+  firm: 'FTMO',
+  accountSize: 25000,
+  stages: [
+    {
+      id: 'step1',
+      name: 'FTMO Challenge',
+      profitTargetPct: 10,
+      maxDrawdownPct: 10,
+      minTradingDays: 4,
+      weekendFlat: false,
+      notes: [
+        'News trading and weekend holding both allowed in this phase',
+        'No time limit, and no consistency rule on the 2-Step',
+      ],
+    },
+    {
+      id: 'step2',
+      name: 'Verification',
+      profitTargetPct: 5,
+      maxDrawdownPct: 10,
+      minTradingDays: 4,
+      weekendFlat: false,
+      notes: [
+        'News trading and weekend holding both allowed in this phase',
+        'Starts again from the original balance',
+      ],
+    },
+    {
+      id: 'funded',
+      name: 'FTMO Account',
+      profitTargetPct: 0,
+      maxDrawdownPct: 10,
+      minTradingDays: 0,
+      weekendFlat: true,
+      notes: [
+        'No holding through any market break longer than 2 hours',
+        'No order execution within 2 minutes either side of a restricted news release',
+      ],
+    },
+  ],
+  dailyLossPct: 5,
+  dailyLossBasis: 'initialBalance',
+  // "the account balance recorded at 00:00 CE(S)T of the current day minus 5% of
+  // the Initial Simulated Capital" — a floating loss held over midnight does not
+  // drag the next day's floor down with it.
+  dailyBaseline: 'balance',
+  serverTz: 'cet',
+  maxDrawdownTrailing: false,
+  allowHedging: true,
+  weekendFlat: false,
+  // Friday close is 23:50 server time (GMT+3 on the platform) = 20:50 UTC.
+  weekendFlatUtcSec: 20 * 3600 + 50 * 60,
+  unsimulated: [
+    'Overnight swaps — FTMO counts them in equity, and they add up when you hold for days',
+    'Margin requirements and stop-out (Standard leverage is 1:100 forex, 1:50 gold)',
+    'Commission varies by instrument: $5/lot on forex, 0.0014% of volume on gold — set it per session',
+    'Funded stage: the 2-minute news blackout, since the app has no economic calendar',
+    'Funded stage: the break rule covers any closure over 2 hours, not only weekends',
+    'Forbidden Trading Practices — tick scalping, latency arbitrage, opposite positions across accounts',
+  ],
+}
+
+export const RULE_SETS: RuleSet[] = [IC_FUNDED_25K, FTMO_2STEP_25K]
 
 export function ruleSetById(id: string | undefined): RuleSet | null {
   if (!id || id === 'none') return null
@@ -170,7 +275,7 @@ export function notionalUsd(symbol: string, lots: number, price: number): number
 }
 
 export function marginUsdFor(rules: RuleSet, symbol: string, lots: number, price: number): number {
-  const lev = rules.leverage[assetClassFor(symbol)] ?? 1
+  const lev = rules.leverage?.[assetClassFor(symbol)] ?? 1
   return notionalUsd(symbol, lots, price) / lev
 }
 
@@ -184,14 +289,26 @@ function lastSundayUtc(year: number, month: number): number {
   return d.getTime() / 1000
 }
 
-/** EET/EEST: UTC+2 in winter, UTC+3 from the last Sunday of March to the last of October. */
-export function eetOffsetHours(ts: number): number {
+/** True from the last Sunday of March to the last Sunday of October (EU summer time). */
+export function isEuDst(ts: number): boolean {
   const y = new Date(ts * 1000).getUTCFullYear()
-  return ts >= lastSundayUtc(y, 2) && ts < lastSundayUtc(y, 9) ? 3 : 2
+  return ts >= lastSundayUtc(y, 2) && ts < lastSundayUtc(y, 9)
+}
+
+/** EET/EEST: UTC+2 in winter, UTC+3 in summer. */
+export function eetOffsetHours(ts: number): number {
+  return isEuDst(ts) ? 3 : 2
+}
+
+/** CET/CEST: UTC+1 in winter, UTC+2 in summer. */
+export function cetOffsetHours(ts: number): number {
+  return isEuDst(ts) ? 2 : 1
 }
 
 export function serverOffsetHours(rules: RuleSet, ts: number): number {
-  return rules.serverTz === 'eet' ? eetOffsetHours(ts) : 0
+  if (rules.serverTz === 'eet') return eetOffsetHours(ts)
+  if (rules.serverTz === 'cet') return cetOffsetHours(ts)
+  return 0
 }
 
 /** Which server-time calendar day a UTC timestamp falls in. */
@@ -282,6 +399,8 @@ export interface RuleRuntimeState {
   troughEquity: number
   dayKey: number
   dayStartEquity: number
+  /** Balance at the daily reset. Absent on rows written before FTMO was added. */
+  dayStartBalance?: number
   dayRealized: number
   /** tradingDays as a plain array — a Set doesn't survive structured cloning in IDB. */
   tradingDays: number[]
@@ -313,6 +432,7 @@ export class RuleRuntime {
   troughEquity: number
   dayKey = 0
   dayStartEquity: number
+  dayStartBalance: number
   dayRealized = 0
   tradingDays = new Set<number>()
   profitableDays = 0
@@ -331,6 +451,7 @@ export class RuleRuntime {
     this.dailyLossBasis = overrides.dailyLossBasis ?? rules.dailyLossBasis
     this.balance = initialBalance
     this.equity = initialBalance
+    this.dayStartBalance = initialBalance
     this.peakEquity = initialBalance
     this.troughEquity = initialBalance
     this.dayStartEquity = initialBalance
@@ -346,6 +467,7 @@ export class RuleRuntime {
     r.troughEquity = s.troughEquity
     r.dayKey = s.dayKey
     r.dayStartEquity = s.dayStartEquity
+    r.dayStartBalance = s.dayStartBalance ?? s.dayStartEquity
     r.dayRealized = s.dayRealized
     r.tradingDays = new Set(s.tradingDays)
     r.profitableDays = s.profitableDays
@@ -366,6 +488,7 @@ export class RuleRuntime {
       troughEquity: this.troughEquity,
       dayKey: this.dayKey,
       dayStartEquity: this.dayStartEquity,
+      dayStartBalance: this.dayStartBalance,
       dayRealized: this.dayRealized,
       tradingDays: [...this.tradingDays],
       profitableDays: this.profitableDays,
@@ -377,13 +500,23 @@ export class RuleRuntime {
     }
   }
 
+  /** What today's floor is measured down from — balance or equity at the reset. */
+  get dayStart(): number {
+    return this.rules.dailyBaseline === 'balance' ? this.dayStartBalance : this.dayStartEquity
+  }
+
   get dailyLimit(): number {
-    const base = this.dailyLossBasis === 'initialBalance' ? this.initialBalance : this.dayStartEquity
+    const base = this.dailyLossBasis === 'initialBalance' ? this.initialBalance : this.dayStart
     return base * this.rules.dailyLossPct / 100
   }
 
   get dailyFloor(): number {
-    return this.dayStartEquity - this.dailyLimit
+    return this.dayStart - this.dailyLimit
+  }
+
+  /** The stage can turn the weekend rule on or off independently of the firm default. */
+  get weekendFlat(): boolean {
+    return this.stage.weekendFlat ?? this.rules.weekendFlat
   }
 
   get maxLimit(): number {
@@ -433,12 +566,15 @@ export class RuleRuntime {
       // whatever has happened by the time this is first called.
       this.dayKey = key
       this.dayStartEquity = this.initialBalance
+      this.dayStartBalance = this.initialBalance
     } else if (key !== this.dayKey) {
       const pct = this.rules.profitableDayPct
       if (pct && this.dayRealized >= this.initialBalance * pct / 100 - EPS) this.profitableDays++
       this.dayKey = key
-      // A new day's baseline is the previous day's end-of-day equity.
+      // A new day's baseline is where the previous day ended — equity for IC,
+      // balance for FTMO, which ignores a position's floating loss at midnight.
       this.dayStartEquity = equity
+      this.dayStartBalance = balance
       this.dayRealized = 0
     }
 
@@ -459,7 +595,7 @@ export class RuleRuntime {
       return this.fail({
         kind: 'daily',
         title: 'Daily loss limit breached',
-        detail: `Equity ${usd(low)} fell below today's floor of ${usd(this.dailyFloor)} — ${usd(this.dailyLimit)} under the ${usd(this.dayStartEquity)} you opened the day on. Floating losses count.`,
+        detail: `Equity ${usd(low)} fell below today's floor of ${usd(this.dailyFloor)} — ${usd(this.dailyLimit)} under the ${usd(this.dayStart)} you opened the day on. Floating losses count.`,
         time: ts,
         equity,
       })
@@ -473,7 +609,7 @@ export class RuleRuntime {
         equity,
       })
     }
-    if (this.rules.weekendFlat && openPositions > 0 && prevTs > 0) {
+    if (this.weekendFlat && openPositions > 0 && prevTs > 0) {
       // Either the clock crossed Friday's cut-off, or the feed jumped the weekend.
       const crossed = ts >= nextWeekendDeadline(this.rules, prevTs)
       const jumped = ts - prevTs > 12 * 3600 && isFriday(prevTs)
@@ -532,7 +668,7 @@ export class RuleRuntime {
     if (this.rules.marginExposureMaxPct) {
       const limit = o.equity * this.rules.marginExposureMaxPct / 100
       if (this.marginUsed + addMargin > limit + EPS) {
-        const lev = this.rules.leverage[assetClassFor(o.symbol)]
+        const lev = this.rules.leverage?.[assetClassFor(o.symbol)] ?? 1
         return {
           ok: false,
           error: `Margin would reach ${usd(this.marginUsed + addMargin)} against a ${usd(limit)} cap (${this.rules.marginExposureMaxPct}% of equity at 1:${lev}). Reduce size.`,
@@ -554,7 +690,7 @@ export class RuleRuntime {
         }
       }
     }
-    if (!warning && this.rules.weekendFlat) {
+    if (!warning && this.weekendFlat) {
       const left = nextWeekendDeadline(this.rules, o.ts) - o.ts
       if (left < 4 * 3600) {
         warning = `Friday close is in ${Math.max(0, Math.round(left / 60))} min — you have to be flat before the weekend.`
@@ -564,17 +700,17 @@ export class RuleRuntime {
   }
 
   status(): RuleStatus {
-    const dailyUsed = Math.max(0, this.dayStartEquity - this.equity)
+    const dailyUsed = Math.max(0, this.dayStart - this.equity)
     const maxUsed = Math.max(0, (this.rules.maxDrawdownTrailing ? this.peakEquity : this.initialBalance) - this.equity)
     const profitUsd = this.balance - this.initialBalance
-    const weekendDeadline = this.rules.weekendFlat && this.lastTs ? nextWeekendDeadline(this.rules, this.lastTs) : null
+    const weekendDeadline = this.weekendFlat && this.lastTs ? nextWeekendDeadline(this.rules, this.lastTs) : null
     return {
       rules: this.rules,
       stage: this.stage,
       initialBalance: this.initialBalance,
       balance: this.balance,
       equity: this.equity,
-      dayStartEquity: this.dayStartEquity,
+      dayStartEquity: this.dayStart,
       dailyLimit: this.dailyLimit,
       dailyFloor: this.dailyFloor,
       dailyUsed,
