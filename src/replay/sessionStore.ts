@@ -1,60 +1,69 @@
-// Persistence for one funded-challenge attempt.
+// Persistence for a replay session.
 //
-// The ReplayEngine lives in memory and dies with the page, but a 2-step
-// evaluation runs over weeks. AttemptStore is the thin layer that keeps the
-// attempt's row in Dexie roughly in step with the running RuleRuntime, so the
-// setup screen can offer it back as "Resume".
+// The ReplayEngine lives in memory and dies with the page, but a backtest can
+// run for weeks of simulated time and a funded evaluation for weeks of real
+// ones. This is the thin layer that keeps a session's row in Dexie roughly in
+// step with the running engine, so the setup screen can offer it back as
+// "Resume". Every session gets a row; a funded-challenge attempt additionally
+// carries its serialised RuleRuntime.
 //
 // Writes are throttled: syncRules fires every simulated minute, which at 16
 // bars/s on a 4h chart is hundreds of calls a second. Nothing here is on the
 // hot path — touch() only sets a flag, and the state is serialised lazily at
 // flush time, so the row always holds a consistent snapshot of *now*, never a
 // stale one queued earlier.
-import { db, type ChallengeAttempt } from '../db'
+import { db, type BacktestSession } from '../db'
 import { ruleSetById, stageOf, type RuleRuntimeState, type SessionRules } from '../lib/propRules'
 
 const SAVE_THROTTLE_MS = 1500
 
-export interface AttemptSnapshot {
+export interface SessionSnapshot {
   resumeTs: number
-  state: RuleRuntimeState
+  balance: number
+  /** Null for a plain backtest — there is no rule tracker to serialise. */
+  state: RuleRuntimeState | null
 }
 
-export interface AttemptSeed {
+export interface SessionSeed {
   accountId: number
   accountName: string
   symbol: string
   spread: number
   commissionPerLot: number
-  rules: SessionRules
+  rules: SessionRules | null
   startingBalance: number
   startTs: number
 }
 
-export async function createAttempt(seed: AttemptSeed, snap: AttemptSnapshot): Promise<number> {
+export async function createSession(seed: SessionSeed, snap: SessionSnapshot): Promise<number> {
   const now = Date.now()
   return (await db.challengeAttempts.add({
     ...seed,
     resumeTs: snap.resumeTs,
+    balance: snap.balance,
     state: snap.state,
-    outcome: snap.state.outcome,
+    outcome: snap.state?.outcome ?? 'running',
     createdAt: now,
     updatedAt: now,
   })) as number
 }
 
-export async function deleteAttempt(id: number): Promise<void> {
-  await db.challengeAttempts.delete(id)
+export async function deleteSession(id: number): Promise<void> {
+  await db.transaction('rw', db.challengeAttempts, db.trades, async () => {
+    await db.challengeAttempts.delete(id)
+    // The trades stay in the journal; they just stop pointing at a session.
+    await db.trades.where('sessionId').equals(id).modify({ sessionId: undefined })
+  })
 }
 
-export class AttemptStore {
+export class SessionStore {
   private timer: ReturnType<typeof setTimeout> | null = null
   private dirty = false
   private disposed = false
 
-  constructor(readonly id: number, private readonly snapshot: () => AttemptSnapshot) {}
+  constructor(readonly id: number, private readonly snapshot: () => SessionSnapshot) {}
 
-  /** Mark the attempt changed. Pass true for the moments worth not losing. */
+  /** Mark the session changed. Pass true for the moments worth not losing. */
   touch(immediate = false) {
     if (this.disposed) return
     this.dirty = true
@@ -71,8 +80,9 @@ export class AttemptStore {
     try {
       await db.challengeAttempts.update(this.id, {
         resumeTs: snap.resumeTs,
+        balance: snap.balance,
         state: snap.state,
-        outcome: snap.state.outcome,
+        outcome: snap.state?.outcome ?? 'running',
         updatedAt: Date.now(),
       })
     } catch {
@@ -89,8 +99,8 @@ export class AttemptStore {
 
 /* ---------------- reading ---------------- */
 
-export interface AttemptSummary {
-  /** Best the account was ever up, measured on equity, not just closed trades. */
+export interface SessionSummary {
+  /** Best the account was ever up, on equity, not just closed trades. */
   peakProfit: number
   /** Deepest it was ever down. Same basis as the breach checks: worst intrabar equity. */
   worstDrawdown: number
@@ -102,11 +112,27 @@ export interface AttemptSummary {
   ruleSetName: string
   /** False once a rule set is removed from the app — the attempt can't be rebuilt. */
   known: boolean
+  /** True for a plain backtest with no rule set attached. */
+  plain: boolean
 }
 
-export function summarizeAttempt(a: ChallengeAttempt): AttemptSummary {
+export function summarizeSession(a: BacktestSession): SessionSummary {
   const s = a.state
-  const rs = ruleSetById(a.rules.ruleSetId)
+  const rs = a.rules ? ruleSetById(a.rules.ruleSetId) : null
+  if (!a.rules || !s) {
+    return {
+      peakProfit: Math.max(0, a.balance - a.startingBalance),
+      worstDrawdown: Math.max(0, a.startingBalance - a.balance),
+      tradingDays: 0,
+      profit: a.balance - a.startingBalance,
+      breachTitle: null,
+      breachDetail: null,
+      stageName: 'Backtest',
+      ruleSetName: 'No rules',
+      known: true,
+      plain: true,
+    }
+  }
   return {
     peakProfit: Math.max(0, s.peakEquity - a.startingBalance),
     worstDrawdown: Math.max(0, a.startingBalance - s.troughEquity),
@@ -117,10 +143,11 @@ export function summarizeAttempt(a: ChallengeAttempt): AttemptSummary {
     stageName: rs ? stageOf(rs, a.rules.stageId).name : a.rules.stageId,
     ruleSetName: rs?.name ?? 'Unknown rule set',
     known: !!rs,
+    plain: false,
   }
 }
 
 /** Newest activity first — the one you most likely want to carry on with. */
-export function sortAttempts(rows: ChallengeAttempt[]): ChallengeAttempt[] {
+export function sortSessions(rows: BacktestSession[]): BacktestSession[] {
   return [...rows].sort((a, b) => b.updatedAt - a.updatedAt)
 }

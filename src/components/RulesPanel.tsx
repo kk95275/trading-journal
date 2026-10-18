@@ -13,8 +13,8 @@ import {
   type RuleStatus,
   type SessionRules,
 } from '../lib/propRules'
-import { summarizeAttempt } from '../replay/attemptStore'
-import type { ChallengeAttempt } from '../db'
+import { summarizeSession } from '../replay/sessionStore'
+import type { BacktestSession } from '../db'
 
 /* ---------------- setup screen ---------------- */
 
@@ -200,36 +200,39 @@ function RuleOverrideControls({
   )
 }
 
-/* ---------------- saved attempts ---------------- */
+/* ---------------- saved sessions ---------------- */
 
 /**
- * A 2-step evaluation runs for weeks, so an attempt outlives the replay session
- * that started it: unfinished ones can be picked back up, finished ones are the
- * record of how the attempt went. Only sessions with a rule set appear here.
+ * Every backtest session is saved, with or without a rule set: unfinished ones
+ * can be picked back up, finished attempts are the record of how they went.
+ * Any of them can be replayed against a firm's rules after the fact.
  */
-export function AttemptsPanel({
-  attempts,
+export function SavedSessionsPanel({
+  sessions,
   busy,
   hasData,
   onResume,
   onDelete,
+  onCheck,
 }: {
-  attempts: ChallengeAttempt[]
+  sessions: BacktestSession[]
   busy: boolean
   /** An attempt can't resume without its instrument's converted bars. */
   hasData: (symbol: string) => boolean
-  onResume: (a: ChallengeAttempt) => void
-  onDelete: (a: ChallengeAttempt) => void
+  onResume: (a: BacktestSession) => void
+  onDelete: (a: BacktestSession) => void
+  onCheck: (a: BacktestSession) => void
 }) {
-  const running = attempts.filter(a => a.outcome === 'running')
-  const done = attempts.filter(a => a.outcome !== 'running')
+  const running = sessions.filter(a => a.outcome === 'running')
+  const done = sessions.filter(a => a.outcome !== 'running')
 
   return (
     <div className="card w-full max-w-md space-y-4">
       <div>
-        <h2 className="text-sm font-semibold text-ink">Challenge attempts</h2>
+        <h2 className="text-sm font-semibold text-ink">Saved sessions</h2>
         <p className="text-[11px] text-muted mt-0.5">
-          An attempt survives reloads. Resume one and the floors, trading-day count and balance carry over.
+          Sessions survive reloads. Resume one and the balance — plus any challenge floors and trading-day
+          count — carry over. Check one to replay its trades against a firm's rules.
         </p>
       </div>
 
@@ -237,7 +240,7 @@ export function AttemptsPanel({
         <div className="space-y-2">
           <div className="label !mb-0">In progress</div>
           {running.map(a => (
-            <RunningAttempt key={a.id} a={a} busy={busy} hasData={hasData} onResume={onResume} onDelete={onDelete} />
+            <ResumableSession key={a.id} a={a} busy={busy} hasData={hasData} onResume={onResume} onDelete={onDelete} onCheck={onCheck} />
           ))}
         </div>
       )}
@@ -256,7 +259,7 @@ export function AttemptsPanel({
               </tr>
             </thead>
             <tbody>
-              {done.map(a => <FinishedAttempt key={a.id} a={a} onDelete={onDelete} />)}
+              {done.map(a => <FinishedSession key={a.id} a={a} onDelete={onDelete} onCheck={onCheck} />)}
             </tbody>
           </table>
         </div>
@@ -265,30 +268,32 @@ export function AttemptsPanel({
   )
 }
 
-function RunningAttempt({
+function ResumableSession({
   a,
   busy,
   hasData,
   onResume,
   onDelete,
+  onCheck,
 }: {
-  a: ChallengeAttempt
+  a: BacktestSession
   busy: boolean
   hasData: (symbol: string) => boolean
-  onResume: (a: ChallengeAttempt) => void
-  onDelete: (a: ChallengeAttempt) => void
+  onResume: (a: BacktestSession) => void
+  onDelete: (a: BacktestSession) => void
+  onCheck: (a: BacktestSession) => void
 }) {
-  const m = summarizeAttempt(a)
+  const m = summarizeSession(a)
   const ready = m.known && hasData(a.symbol)
   const blocked = !m.known
-    ? `${a.rules.ruleSetId} is no longer in the app, so this attempt can't be rebuilt.`
+    ? `${a.rules?.ruleSetId} is no longer in the app, so this attempt can't be rebuilt.`
     : !hasData(a.symbol) ? `No converted ${a.symbol} data to replay.` : undefined
 
   return (
     <div className="rounded-lg border border-accent/30 bg-accent/5 p-2.5 space-y-2">
       <div className="flex items-start gap-2">
         <div className="min-w-0 flex-1">
-          <div className="text-xs text-ink truncate">{m.ruleSetName}</div>
+          <div className="text-xs text-ink truncate">{m.plain ? a.accountName : m.ruleSetName}</div>
           <div className="text-[11px] text-muted">
             {m.stageName} · {a.symbol} · paused at {fmtDateTime(a.resumeTs)} GMT
           </div>
@@ -300,27 +305,40 @@ function RunningAttempt({
         >×</button>
       </div>
       <div className="flex items-baseline gap-3 text-[11px]">
-        <span className="text-ink2">{fmtUsd(a.state.balance, 0)}</span>
+        <span className="text-ink2">{fmtUsd(a.balance, 0)}</span>
         <span className={m.profit > 0 ? 'text-up' : m.profit < 0 ? 'text-down' : 'text-muted'}>
           {m.profit > 0 ? '+' : ''}{fmtUsd(m.profit, 0)}
         </span>
-        <span className="text-muted">{m.tradingDays} trading day{m.tradingDays === 1 ? '' : 's'}</span>
+        {!m.plain && <span className="text-muted">{m.tradingDays} trading day{m.tradingDays === 1 ? '' : 's'}</span>}
       </div>
-      <button
-        className="btn-ghost w-full text-xs disabled:opacity-40"
-        disabled={busy || !ready}
-        title={blocked}
-        onClick={() => onResume(a)}
-      >
-        Resume
-      </button>
+      <div className="flex gap-2">
+        <button
+          className="btn-ghost flex-1 text-xs disabled:opacity-40"
+          disabled={busy || !ready}
+          title={blocked}
+          onClick={() => onResume(a)}
+        >
+          Resume
+        </button>
+        <button
+          className="btn-ghost flex-1 text-xs"
+          title="Replay this session's trades against a firm's rules"
+          onClick={() => onCheck(a)}
+        >
+          Check vs rules
+        </button>
+      </div>
       {blocked && <div className="text-[11px] text-warn">{blocked}</div>}
     </div>
   )
 }
 
-function FinishedAttempt({ a, onDelete }: { a: ChallengeAttempt; onDelete: (a: ChallengeAttempt) => void }) {
-  const m = summarizeAttempt(a)
+function FinishedSession({ a, onDelete, onCheck }: {
+  a: BacktestSession
+  onDelete: (a: BacktestSession) => void
+  onCheck: (a: BacktestSession) => void
+}) {
+  const m = summarizeSession(a)
   const passed = a.outcome === 'passed'
   return (
     <>
@@ -331,10 +349,15 @@ function FinishedAttempt({ a, onDelete }: { a: ChallengeAttempt; onDelete: (a: C
         <td className={`td font-medium ${passed ? 'text-up' : 'text-down'}`}>{passed ? '✓ Passed' : '✕ Failed'}</td>
         <td className="td text-right text-up">{fmtUsd(m.peakProfit, 0)}</td>
         <td className="td text-right text-down">{fmtUsd(m.worstDrawdown, 0)}</td>
-        <td className="td text-right !px-0">
+        <td className="td text-right !px-0 whitespace-nowrap">
           <span className="text-ink2">{m.tradingDays}</span>
           <button
-            className="ml-2 text-muted hover:text-down"
+            className="ml-2 text-muted hover:text-ink"
+            title="Replay this session's trades against a firm's rules"
+            onClick={() => onCheck(a)}
+          >⚖</button>
+          <button
+            className="ml-1.5 text-muted hover:text-down"
             title="Remove from history"
             onClick={() => onDelete(a)}
           >×</button>
@@ -344,7 +367,7 @@ function FinishedAttempt({ a, onDelete }: { a: ChallengeAttempt; onDelete: (a: C
         <tr>
           <td className="td !px-0 !pt-0 !border-0 text-[11px] text-down" colSpan={5} title={m.breachDetail ?? undefined}>
             {m.breachTitle}
-            {a.state.overridden && <span className="text-warn"> · kept trading for practice</span>}
+            {a.state?.overridden && <span className="text-warn"> · kept trading for practice</span>}
           </td>
         </tr>
       )}

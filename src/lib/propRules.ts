@@ -582,20 +582,25 @@ export class RuleRuntime {
     this.lastTs = ts
     if (this.outcome !== 'running' || this.overridden) return null
 
-    if (low < this.maxFloor - EPS) {
+    // Both floors can go in one move. Equity falls through the HIGHER one first,
+    // so that's the rule the firm would flag — and which is higher depends on
+    // the day: well into drawdown, the static floor sits above the daily one.
+    const brokeDaily = low < this.dailyFloor - EPS
+    const brokeMax = low < this.maxFloor - EPS
+    if (brokeDaily || brokeMax) {
+      if (brokeDaily && (!brokeMax || this.dailyFloor >= this.maxFloor)) {
+        return this.fail({
+          kind: 'daily',
+          title: 'Daily loss limit breached',
+          detail: `Equity ${usd(low)} fell below today's floor of ${usd(this.dailyFloor)} — ${usd(this.dailyLimit)} under the ${usd(this.dayStart)} you opened the day on. Floating losses count.`,
+          time: ts,
+          equity,
+        })
+      }
       return this.fail({
         kind: 'maxdd',
         title: 'Max drawdown breached',
         detail: `Equity ${usd(low)} fell below the ${this.maxDrawdownPct}% floor of ${usd(this.maxFloor)}. That floor is static — it never moves up with profit.`,
-        time: ts,
-        equity,
-      })
-    }
-    if (low < this.dailyFloor - EPS) {
-      return this.fail({
-        kind: 'daily',
-        title: 'Daily loss limit breached',
-        detail: `Equity ${usd(low)} fell below today's floor of ${usd(this.dailyFloor)} — ${usd(this.dailyLimit)} under the ${usd(this.dayStart)} you opened the day on. Floating losses count.`,
         time: ts,
         equity,
       })

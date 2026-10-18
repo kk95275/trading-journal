@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { db, getSetting, setSetting, type ChallengeAttempt } from '../db'
+import { db, getSetting, setSetting, type BacktestSession } from '../db'
 import type { Confirmation, Direction, Trade } from '../lib/types'
 import { fmtDateTime, fmtR, fmtUsd, riskUsd } from '../lib/gold'
 import { fmtPx, specFor } from '../lib/symbols'
@@ -12,14 +12,15 @@ import { defaultSessionsConfig, type SessionsConfig } from '../replay/sessions'
 import { defaultIndicatorsConfig, migrateIndicatorsConfig, type IndicatorsConfig } from '../replay/indicators'
 import { openSyncChannel, snapshotOf, REPLAY_SYNC_LOCALSTORAGE, type SyncMessage } from '../replay/syncChannel'
 import { ruleSetById, stageOf, type SessionRules } from '../lib/propRules'
-import { deleteAttempt, sortAttempts, summarizeAttempt } from '../replay/attemptStore'
+import { deleteSession, sortSessions, summarizeSession } from '../replay/sessionStore'
 import ReplayChart, { type ChartHandle } from '../components/ReplayChart'
 import SessionsPanel from '../components/SessionsPanel'
 import IndicatorsPanel from '../components/IndicatorsPanel'
 import { PnlText } from '../components/ui'
 import AnalyzeButton from '../components/AnalyzeButton'
 import SetupModal from '../components/SetupModal'
-import { AttemptsPanel, RuleBanner, RuleSetPicker, RulesHud } from '../components/RulesPanel'
+import { RuleBanner, RuleSetPicker, RulesHud, SavedSessionsPanel } from '../components/RulesPanel'
+import ChallengeCheckModal from '../components/ChallengeCheckModal'
 
 const MAX_PANES = 3
 
@@ -83,15 +84,16 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState('')
 
-  // Saved challenge attempts for whichever account is selected. A brand-new
-  // account has none, and plain backtesting never writes any.
-  const attempts = useLiveQuery(
+  // Saved sessions for whichever account is selected — every backtest is saved,
+  // with or without a rule set. A brand-new account has none.
+  const sessions = useLiveQuery(
     () => typeof accountId === 'number'
       ? db.challengeAttempts.where('accountId').equals(accountId).toArray()
-      : Promise.resolve([] as ChallengeAttempt[]),
+      : Promise.resolve([] as BacktestSession[]),
     [accountId],
-    [] as ChallengeAttempt[],
+    [] as BacktestSession[],
   )
+  const [checking, setChecking] = useState<BacktestSession | null>(null)
 
   useEffect(() => {
     // detect which symbols have converted data — re-runs whenever the instrument list
@@ -205,7 +207,7 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
    * on. The session starts flat — any position still open when it was last
    * saved is not carried, so the balance is the realized one.
    */
-  const resume = async (a: ChallengeAttempt) => {
+  const resume = async (a: BacktestSession) => {
     setError('')
     setStarting(true)
     try {
@@ -217,8 +219,8 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
         spread: a.spread,
         commissionPerLot: a.commissionPerLot,
         startingBalance: a.startingBalance,
-        rules: a.rules,
-        resume: { attemptId: a.id!, state: a.state },
+        rules: a.rules ?? undefined,
+        resume: { sessionId: a.id!, balance: a.balance, state: a.state },
       }
       onStart(await ReplayEngine.create(config))
     } catch (e: any) {
@@ -227,16 +229,16 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
     }
   }
 
-  const discard = async (a: ChallengeAttempt) => {
-    const m = summarizeAttempt(a)
+  const discard = async (a: BacktestSession) => {
+    const m = summarizeSession(a)
     const what = a.outcome === 'running'
-      ? `Discard the in-progress ${m.stageName} attempt (${fmtUsd(a.state.balance, 0)}, ${m.tradingDays} trading days)?`
+      ? `Discard the in-progress ${m.stageName} session (${fmtUsd(a.balance, 0)}${m.plain ? '' : `, ${m.tradingDays} trading days`})?`
       : `Remove the ${a.outcome} ${m.stageName} attempt from history?`
     if (!confirm(`${what} The trades it produced stay in the journal.`)) return
-    await deleteAttempt(a.id!)
+    await deleteSession(a.id!)
   }
 
-  const sorted = sortAttempts(attempts)
+  const sorted = sortSessions(sessions)
 
   return (
     <div className={`flex justify-center gap-4 h-full p-6 ${sorted.length ? 'items-start overflow-y-auto' : 'items-center'}`}>
@@ -316,14 +318,16 @@ function SessionSetup({ onStart }: { onStart: (e: ReplayEngine) => void }) {
         </div>
       </div>
       {sorted.length > 0 && (
-        <AttemptsPanel
-          attempts={sorted}
+        <SavedSessionsPanel
+          sessions={sorted}
           busy={starting}
           hasData={sym => !!ranges[sym]}
           onResume={a => void resume(a)}
           onDelete={a => void discard(a)}
+          onCheck={setChecking}
         />
       )}
+      {checking && <ChallengeCheckModal session={checking} onClose={() => setChecking(null)} />}
     </div>
   )
 }
@@ -457,7 +461,7 @@ function Session({ engine, onEnd }: { engine: ReplayEngine; onEnd: () => void })
     engine.onTradeClosed = (trade: Trade) => {
       setTimeout(async () => {
         const shot = await chartRef.current?.screenshot()
-        await db.trades.add({ ...trade, screenshot: shot ?? undefined })
+        await db.trades.add({ ...trade, sessionId: engine.sessionId ?? undefined, screenshot: shot ?? undefined })
       }, 150)
     }
     return () => { engine.onTradeClosed = null }
