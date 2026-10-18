@@ -107,7 +107,8 @@
     "publish": {
       "provider": "github",
       "owner": "kk95275",
-      "repo": "trading-journal"
+      "repo": "trading-journal",
+      "releaseType": "release"
     }
   }
 }
